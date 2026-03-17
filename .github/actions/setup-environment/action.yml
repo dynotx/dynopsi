@@ -1,0 +1,25 @@
+name: 'Setup Environment'
+description: 'Sets up gcloud auth, Cloud SDK, uv, just, and bootstraps the environment'
+
+inputs:
+  uv_version:
+    description: 'Version of uv to install'
+    required: true
+  just_version:
+    description: 'Version of just to install'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        version: ${{ inputs.uv_version }}
+    - name: Setup just
+      uses: extractions/setup-just@v3
+      with:
+        just-version: ${{ inputs.just_version }}
+    - name: Bootstrap environment
+      shell: bash
+      run: just bootstrap

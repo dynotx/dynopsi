@@ -1,0 +1,63 @@
+featurization_pipelines:
+    trka_1www_original_residue_index:
+        type: dynopsi_binder_design_featurization_pipeline
+        index_type: original_residue_index
+        rcsb_record_id: 1www
+        crops:
+            crop_1: C1-101
+        hotspots:
+            hotspot_VML: C13,C15,C52
+        new_chains_lengths: [60, 80, 100, 120]
+        new_chains_centers_of_mass:
+                vibecenter:
+                    type: predefined_center_of_mass
+                    centers_of_mass: [[29.398, -9.294, -13.985]]
+    trka_1www_author_residue_index:
+        type: dynopsi_binder_design_featurization_pipeline
+        index_type: auth_residue_index
+        rcsb_record_id: 1www
+        crops:
+            crop_1: X282-382
+        hotspots:
+            hotspot_VML: X294,X296,X333
+        new_chains_lengths: [60, 80, 100, 120]
+        new_chains_centers_of_mass:
+                vibecenter:
+                    type: predefined_center_of_mass
+                    centers_of_mass: [[29.398, -9.294, -13.985]]
+
+simulation_pipelines:
+    sde_100_steps_default:
+        type: sde_simulation
+        time_sampler:
+            type: linear_time_sampler
+            num_steps: 100
+        diffusion_coefficient_fn:
+            type: inverse_parameter
+            eps: 0.02
+            clamp_max: 10.0
+        noise_scale_fn:
+            type: constant
+            constant: 0.1
+        score_scale_fn:
+            type: constant
+            constant: 1.5
+        t_thresh_score_weighting_only: 0.9
+
+output_specifications:
+    default_output_specification:
+        output_dir: ./example/output
+        formats: [pdb, npz]
+        save_trajectory: False
+
+design_pipelines: # these two pipelines are the same, don't run both!
+    trka_1www_binder_design_original_residue_index:
+        type: dynopsi_binder_design_pipeline
+        featurization_pipeline: trka_1www_original_residue_index
+        simulation_pipeline: sde_100_steps_default
+        output_specification: default_output_specification
+    trka_1www_binder_design_author_residue_index:
+        type: dynopsi_binder_design_pipeline
+        featurization_pipeline: trka_1www_author_residue_index
+        simulation_pipeline: sde_100_steps_default
+        output_specification: default_output_specification

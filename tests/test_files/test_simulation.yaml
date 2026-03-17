@@ -1,0 +1,115 @@
+featurization_pipelines:
+    vegfa_1bj1:
+        type: dynopsi_binder_design_featurization_pipeline
+        index_type: auth_residue_index
+        rcsb_record_id: 1bj1
+        crops:
+            crop_14_107: V14-107,W14-107
+        hotspots:
+            hotspot_81M_83I_91I: W81,W83,W91
+        new_chains_lengths: [80]
+        new_chains_centers_of_mass:
+                testcenter:
+                    type: predefined_center_of_mass
+                    centers_of_mass: [[32.0603, -6.7852173, 29.20792]]
+
+    il7ra_3di3_binder_design:
+        type: dynopsi_binder_design_featurization_pipeline
+        rcsb_record_id: 3di3
+        index_type: auth_residue_index
+        crops:
+            crop_17_209: B17-209
+        hotspots:
+            hotspot_58V_80L_139Y: B58,B80,B139
+        new_chains_lengths: [60]
+        new_chains_centers_of_mass:
+            hitcenter:
+                type: predefined_center_of_mass
+                centers_of_mass: [[28.1, 41.4, 47.9]]
+
+simulation_pipelines:
+    sde_test_config_1:
+        type: sde_simulation
+        time_sampler:
+            type: linear_time_sampler
+            num_steps: 2
+        diffusion_coefficient_fn:
+            type: inverse_parameter
+            eps: 0.02
+            clamp_max: 10.0
+        noise_scale_fn:
+            type: constant
+            constant: 0.0
+        score_scale_fn:
+            type: constant
+            constant: 0.0
+        t_thresh_score_weighting_only: 0.0
+
+    sde_test_config_2:
+        type: sde_simulation
+        time_sampler:
+            type: linear_time_sampler
+            num_steps: 2
+        diffusion_coefficient_fn:
+            type: inverse_parameter
+            eps: 0.02
+            clamp_max: 10.0
+        noise_scale_fn:
+            type: constant
+            constant: 0.1
+        score_scale_fn:
+            type: constant
+            constant: 0.0
+        t_thresh_score_weighting_only: 1.0
+
+    sde_test_config_3:
+        type: sde_simulation
+        time_sampler:
+            type: log_time_sampler
+            num_steps: 2
+            p: 1.0
+        diffusion_coefficient_fn:
+            type: inverse_parameter
+            eps: 0.02
+            clamp_max: 10.0
+        noise_scale_fn:
+            type: constant
+            constant: 0.1
+        score_scale_fn:
+            type: constant
+            constant: 1.5
+        t_thresh_score_weighting_only: 0.9
+
+    ode_test_config:
+        type: ode_simulation
+        time_sampler:
+            type: linear_time_sampler
+            num_steps: 2
+
+output_specifications:
+    default_output_specification:
+        output_dir: ./tmp/test_cli_output
+        formats: [pdb, npz]
+        save_trajectory: False
+
+design_pipelines:
+    il7ra_3di3_sde_test_config_1:
+        type: dynopsi_binder_design_pipeline
+        featurization_pipeline: il7ra_3di3_binder_design
+        simulation_pipeline: sde_test_config_1
+        output_specification: default_output_specification
+    il7ra_3di3_sde_test_config_2:
+        type: dynopsi_binder_design_pipeline
+        featurization_pipeline: il7ra_3di3_binder_design
+        simulation_pipeline: sde_test_config_3
+        output_specification: default_output_specification
+    vegfa_1bj1_sde_test_config_3:
+        type: dynopsi_binder_design_pipeline
+        featurization_pipeline: vegfa_1bj1
+        simulation_pipeline: sde_test_config_3
+        output_specification: default_output_specification
+    vegfa_1bj1_ode_test_config:
+        type: dynopsi_binder_design_pipeline
+        featurization_pipeline: vegfa_1bj1
+        simulation_pipeline: ode_test_config
+        output_specification: default_output_specification

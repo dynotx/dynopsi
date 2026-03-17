@@ -1,0 +1,136 @@
+[build-system]
+requires = ["uv_build>=0.8.15,<0.9"]
+build-backend = "uv_build"
+
+
+[project]
+name = "dynopsi"
+version = "0.0.1"
+description = "dynopsi inference model for protein binder design"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+authors = [{ name = "DynoTx Open Source", email = "opensource@dynotx.com" }]
+license = { text = "Apache-2.0" }
+dependencies = [
+    "einops>=0.8.0,<0.9",
+    "gemmi==0.7.5",
+    "pdbeccdutils==1.0.3",
+    "huggingface-hub>=0.20.0",
+    "pydantic>=2.0",
+    "rdkit==2025.9.1",
+    "scipy",
+    "smart-open",
+    "torch>=2.6.0",
+]
+
+[project.scripts]
+dynopsi = "dynopsi.cli:main"
+
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18.2",
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.13.3",
+    "scipy-stubs",
+    "types-PyYAML",
+]
+
+
+[tool.mypy]
+check_untyped_defs = true
+disallow_untyped_defs = true
+explicit_package_bases = true
+mypy_path = "src"
+namespace_packages = true
+no_implicit_optional = true
+packages = ["dynopsi"]
+plugins = []
+show_error_codes = true
+strict_optional = true
+warn_unused_ignores = true
+disable_error_code = ["union-attr"]
+
+[[tool.mypy.overrides]]
+module = [
+    "gemmi.*",
+    "pdbeccdutils.*",
+    "pydantic.*",
+    "rdkit.*",
+    "requests",
+    "scipy.*",
+    "smart_open",
+    "smart_open.*",
+    "yaml",
+]
+ignore_missing_imports = true
+disable_error_code = ["import-untyped"]
+
+[tool.pytest.ini_options]
+addopts = ["--dist=loadgroup", "--durations=50", "--import-mode=importlib", "-n", "auto", "-q", "--cov=dynopsi", "--cov-report=term-missing"]
+filterwarnings = []
+testpaths = ["tests"]
+
+
+[tool.ruff]
+line-length = 120
+target-version = 'py310'
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle error
+    "F",  # pyflakes
+    "W",  # pycodestyle warning
+    "I",  # import
+    "UP", # pyupgrade
+    "D",  # pydocstyle
+]
+ignore = [
+    "D100", # No docstring in public module
+    "D101", # No docstring in public class
+    "D102", # No docstring in public method
+    "D103", # No docstring in public function
+    "D104", # No docstring in public package
+    "D105", # Missing docstring in magic method
+    "D205", # Ignore blank line requirements in docstrings
+    "D400", # First line should end with a period
+    "D410", # Missing blank line after section
+    "D411", # Missing blank line before section
+    "E501", # recommended ignores for formatter
+    "E721", # E721 Do not compare types, use `isinstance()`
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dynopsi"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.uv]
+environments = ["sys_platform == 'darwin'", "sys_platform == 'linux'"]
+keyring-provider = "subprocess"
+required-version = ">=0.8.15"
+
+[tool.uv.build-backend]
+module-name = "dynopsi"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.deptry]
+known_first_party = ["dynopsi"]

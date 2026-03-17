@@ -1,0 +1,69 @@
+# -------------------------
+# Python & build artifacts
+# -------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+*.pyo
+*.pyd
+build/
+dist/
+.eggs/
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.venv/
+.env/
+.uv/
+.uv-cache/
+
+# -------------------------
+# IDEs & editors
+# -------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# -------------------------
+# Tests & coverage
+# -------------------------
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# -------------------------
+# Logs & temp files
+# -------------------------
+*.log
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+*.orig
+
+# -------------------------
+# Local data or generated
+# -------------------------
+.cache/
+*.db
+*.sqlite
+*.jsonl
+
+# -------------------------
+# Copier template artifacts
+# -------------------------
+.copier-answers.yml
+copier-update.*
+
+
+# -------------------------
+# Agentic files
+# -------------------------
+CLAUDE.md
+AGENT.md

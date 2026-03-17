@@ -1,0 +1,49 @@
+
+THIRD PARTY NOTICES
+
+This project incorporates modules derived from third-party open source software projects. 
+Review the license terms of these open source projects before use.
+
+-----------------------
+OpenFold
+Copyright (c) 2024 AlQuraishi Laboratory 
+License: [Apache 2.0] — see LICENSES/OPENFOLD
+Source: https://github.com/aqlaboratory/openfold
+
+Portions of this software are derived from OpenFold.
+-----------------------
+La Proteina
+Copyright (c) 2025 NVIDIA
+License: [Apache 2.0] — see LICENSES/LAPROTEINA
+Source: https://github.com/NVIDIA-Digital-Bio/la-proteina
+
+Portions of this software are derived from La Proteina.
+-----------------------
+Multiflow
+Copyright (c) 2024 Andrew Campbell, Jason Yim
+License: [MIT] — see LICENSES/MULTIFLOW
+Source: https://github.com/jasonkyuyim/multiflow
+
+Portions of this software are derived from Multiflow.
+-----------------------
+Boltz
+Copyright (c) 2024 Jeremy Wohlwend, Gabriele Corso, Saro Passaro
+License: [MIT] — see LICENSES/BOLTZ
+Source: https://github.com/jwohlwend/boltz
+
+Portions of this software are derived from Boltz.
+-----------------------
+protein-docking
+Copyright (c) 2022 MattMcPartlon
+License: [MIT] — see LICENSES/PROTEINDOCKING
+Source: https://github.com/MattMcPartlon/protein-docking
+
+Portions of this software are derived from protein-docking.
+-----------------------
+FrameFlow
+Copyright (c) Microsoft Corporation.
+License: [MIT] — see LICENSES/FRAMEFLOW
+Source: https://github.com/microsoft/protein-frame-flow
+
+Portions of this software are derived from FrameFlow.
+-----------------------
