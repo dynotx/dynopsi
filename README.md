@@ -1,6 +1,8 @@
+![](./assets/binder_grid2.png)
+
 # Dyno Psi-1
 
-[Link to white paper](link-to-paper)
+[Link to white paper](https://dynopsi.dynotx.com/dynopsi_whitepaper.pdf)
 
 This repository enables inference and sampling for Dyno Psi-1, a *de novo* miniprotein binder design model. The binder design pipeline is configurable and modular, supporting binder generation against both single and multi-chain targets. Backbone atom coordinates are output for each designed binder and can be exported in multiple formats for downstream analysis. [ProteinMPNN](https://github.com/dauparas/ProteinMPNN) is recommended to generate accompanying sequences, and recommended settings are provided below [in the sequence design section](#sequence-design-with-proteinmpnn).
 Dyno Psi model checkpoints and supplementary datasets are hosted on Hugging Face

@@ -34,6 +34,8 @@ For example, these are two equivalent featurizations for [TrkA](https://www.rcsb
 ### Choosing a binder center of mass
 Our model requires the user to specify an estimate for the center of mass of the binder chain relative to the target. We have achieved the best results by defining custom centers of mass. Below is an example of how to select a center of mass for [IL-7RA](https://www.rcsb.org/structure/3DI3) in [PyMOL](https://www.pymol.org/).
 
+Note that when you run the `dynopsi check` command, the entire structure will be globally translated to the binder center of mass.
+
 ```pymol
 # load the target structure into PyMOL
 fetch 3di3
