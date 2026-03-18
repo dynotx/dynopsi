@@ -111,7 +111,7 @@ featurization_pipeline = DynoPsiBinderDesignFeaturizationPipeline(
 
 ### Simulation
 
-The simulation configuration controls the sampler, including which solver to use (ODE/SDE) and its parameters. Beyond the default solvers, sampling behavior can be customized by composing `Ops` — instructions that define the denoising trajectory — into a `Simulation` procedure. This makes it straightforward to introduce guidance, impose symmetry, or otherwise modify the sampling dynamics. For vanilla miniprotein binder design, we recommend the following defaults:
+The simulation configuration controls the sampler, including which solver to use (ODE/SDE) and its parameters. Beyond the default solvers, sampling behavior can be customized by composing `Ops` — instructions that define the denoising trajectory — into a `Simulation` procedure. This makes it straightforward to introduce guidance (coming soon!), impose symmetry, or otherwise modify the sampling dynamics. For vanilla miniprotein binder design, we recommend the following defaults:
 
 YAML version:
 
