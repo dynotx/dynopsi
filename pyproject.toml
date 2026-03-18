@@ -5,7 +5,7 @@ build-backend = "uv_build"
 
 [project]
 name = "dynopsi"
-version = "0.0.2rc1"
+version = "1.0.0"
 description = "dynopsi inference model for protein binder design"
 readme = "README.md"
 requires-python = ">=3.10,<3.11"
