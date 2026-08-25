@@ -13,11 +13,11 @@ runs:
   using: 'composite'
   steps:
     - name: Setup uv
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@v10.0.1
       with:
         version: ${{ inputs.uv_version }}
     - name: Setup just
-      uses: extractions/setup-just@v3
+      uses: extractions/setup-just@v4
       with:
         just-version: ${{ inputs.just_version }}
     - name: Bootstrap environment

@@ -24,14 +24,14 @@ jobs:
       MYPY_CACHE_DIR: /tmp/mypy-cache
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
           uv_version: ${{ env.UV_VERSION }}
           just_version: ${{ env.JUST_VERSION }}
       - name: Cache mypy
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.MYPY_CACHE_DIR }}
           key: mypy-${{ hashFiles('uv.lock') }}-v1 # NOTE: Bump to manually cache bust
@@ -46,7 +46,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
