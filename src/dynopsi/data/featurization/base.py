@@ -2,15 +2,20 @@ import uuid
 from collections.abc import ItemsView, Iterable, Iterator, KeysView, Mapping, ValuesView
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Self, cast
 
 import numpy as np
 import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from typing_extensions import Self
 
-from dynopsi.data.constants import TOKENS, AtomFilter, PocketFeature
-from dynopsi.data.featurization.utils import add_oxygen_to_bb_features, strip_chain_padding
+from dynopsi.data.auth_chain_identity import (
+    auth_chain_id_table_from_chains,
+    checked_auth_chain_id,
+    lookup_auth_chain_id,
+    merge_auth_chain_id_tables,
+)
+from dynopsi.data.constants import TOKENS, AtomFilter, InpaintFeature, PocketFeature
+from dynopsi.data.featurization.utils import add_oxygen_to_bb_features, crop_features, strip_chain_padding
 from dynopsi.data.structure import (
     ATOMS_DTYPE,
     CHAIN_INTERFACE_DTYPE,
@@ -21,7 +26,8 @@ from dynopsi.data.structure import (
     Structure,
 )
 from dynopsi.data.structure_io import save_structures_to_file
-from dynopsi.data.utils import ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP
+from dynopsi.data.utils import ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP, ChainResidueRepr, align_by_mask
+from dynopsi.utils.strict_config import StrictConfig
 
 
 ####################
@@ -42,6 +48,8 @@ class Features(BaseModel, Mapping):
     featurization_metadata: dict[str, Any], the dictionary of metadata about the features, keyed by the name of the featurizer. Managed internally; not set by the user.
     input_reference_structure: Structure | None, the full-atom input reference structure. This will be
        modified to reflect cropping, rotations, translations that are performed on the input. Managed internally; not set by the user.
+    auth_chain_id_table: dict[int, str], opaque auth_asym_id → original auth chain string. Unique [A-Z]
+       IDs stay letter-stable.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -61,6 +69,7 @@ class Features(BaseModel, Mapping):
     # which will be modified to reflect cropping, rotations, translations
     # that are performed on the input
     input_reference_structure: Structure | None = Field(default=None, init=False)
+    auth_chain_id_table: dict[int, str] = Field(default_factory=dict)
 
     def add_step(self, featurizer_type: str, featurizer_name: str) -> None:
         """Add a featurization step to the processing pipeline.
@@ -137,10 +146,11 @@ class Features(BaseModel, Mapping):
             .tolist()
         )
 
+        auth_table = self.resolved_auth_chain_id_table()
         binder_chains = [ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP[asym_id] for asym_id in binder_asym_ids]
         target_chains = [ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP[asym_id] for asym_id in target_asym_ids]
-        binder_auth_chains = [ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP[auth_asym_id] for auth_asym_id in binder_auth_asym_ids]
-        target_auth_chains = [ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP[auth_asym_id] for auth_asym_id in target_auth_asym_ids]
+        binder_auth_chains = [lookup_auth_chain_id(auth_asym_id, auth_table) for auth_asym_id in binder_auth_asym_ids]
+        target_auth_chains = [lookup_auth_chain_id(auth_asym_id, auth_table) for auth_asym_id in target_auth_asym_ids]
 
         augmented_metadata = {
             **metadata,
@@ -153,6 +163,36 @@ class Features(BaseModel, Mapping):
 
         return augmented_metadata
 
+    def align_coordinates(self, coords_stack: torch.Tensor) -> torch.Tensor:
+        """
+        Align the coordinates in the stack using feature information.
+
+        Align to the last element of the batch dimension in the coordinates (coords_stack[-1]),
+        and only include resolved atoms.
+
+        Parameters
+        ----------
+        coords_stack: torch.Tensor
+            Shape (batch, n_atoms_padded, 3), the stack of coordinates to be aligned.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of aligned coordinates, shape (batch, n_atoms, 3).
+        """
+        coords_stack = coords_stack[:, self.feature_dict["atom_pad_mask"].bool(), :]
+
+        # Align to the last element of the batch.
+        # For trajectories, this typically the final denoised structure
+        reference_coords = coords_stack[-1]  # (n_atoms, 3)
+        reference_mask = self.feature_dict["atom_resolved_mask"].bool()
+
+        coords_aligned = torch.zeros_like(coords_stack)
+        for b_i in range(coords_stack.shape[0]):
+            coords_aligned[b_i] = align_by_mask(coords_stack[b_i], reference_coords, reference_mask, reference_mask)
+
+        return coords_aligned
+
     def safe_copy(self) -> Self:
         """Return a deep copy of this Features object.
 
@@ -163,11 +203,139 @@ class Features(BaseModel, Mapping):
             k: v.clone() if isinstance(v, torch.Tensor) else deepcopy(v) for k, v in self.feature_dict.items()
         }
 
-        features_copy = self.__class__(feature_dict=feature_dict_copy, atoms_to_include=deepcopy(self.atoms_to_include))
+        features_copy = self.__class__(
+            feature_dict=feature_dict_copy,
+            atoms_to_include=deepcopy(self.atoms_to_include),
+            auth_chain_id_table=deepcopy(self.auth_chain_id_table),
+        )
         features_copy.featurization_steps = deepcopy(self.featurization_steps)
         features_copy.featurization_metadata = deepcopy(self.featurization_metadata)
         features_copy.input_reference_structure = deepcopy(self.input_reference_structure)
         return features_copy
+
+    def to_device(self, device: torch.device) -> None:
+        self.feature_dict = {
+            key: (value.to(device) if isinstance(value, torch.Tensor) else value)
+            for key, value in self.feature_dict.items()
+        }
+
+    def design_coordinates_to_structure(
+        self, coords_stack: torch.Tensor, *, use_reference_for_noised_context: bool = False
+    ) -> list[Structure]:
+        """Take a stack of designed coordinates based on this featurization and convert them to Structure objects.
+
+        - Align the coordinates to the features
+        - If there is an input_reference_structure, crop the coordinates for the design to not include the reference
+        structure, and concatenate the reference structure.
+        - If there is not an input_reference_structure, just convert the coordinates to a Structure.
+
+        Parameters
+        ----------
+        coords_stack: torch.Tensor
+            Shape (batch, n_atoms_padded, 3), the stack of coordinates to be aligned.
+        use_reference_for_noised_context: bool
+            Replace context residues with the input reference structure even when
+            their coordinates were generated by the model.
+
+        Returns
+        -------
+        A list of Structures, one per batch element in coords_stack. The coordinates of these Structures are aligned
+        to the Features (see Features.align_coordinates) and if an all-atom input_reference_structure exists in this
+        Features object, then its residue coordinates replace fixed context and,
+        when requested, noised context in coords_stack.
+        """
+        if self.atoms_to_include is None:
+            raise ValueError("atoms_to_include must be set")
+
+        feature_dict_copy = {
+            k: v.clone() if isinstance(v, torch.Tensor) else deepcopy(v) for k, v in self.feature_dict.items()
+        }
+
+        aligned_coords = self.align_coordinates(coords_stack)
+
+        structures = []
+
+        for b_i in range(coords_stack.shape[0]):
+            feature_dict_copy["coords"] = aligned_coords[b_i].unsqueeze(0)
+            if self.input_reference_structure is None:
+                structure = self.__class__(
+                    feature_dict=feature_dict_copy,
+                    atoms_to_include=self.atoms_to_include,
+                    auth_chain_id_table=deepcopy(self.auth_chain_id_table),
+                ).to_structure()
+            else:
+                pad_mask = feature_dict_copy["token_pad_mask"].bool()
+                context_mask = (
+                    torch.isin(
+                        feature_dict_copy["inpaint_feature"],
+                        torch.tensor([InpaintFeature.BINDER_CONTEXT, InpaintFeature.TARGET_CONTEXT]),
+                    )
+                    & pad_mask
+                )
+                inpaint_mask = (
+                    torch.isin(
+                        feature_dict_copy["inpaint_feature"],
+                        torch.tensor([InpaintFeature.BINDER_INPAINT, InpaintFeature.TARGET_INPAINT]),
+                    )
+                    & pad_mask
+                )
+                noised_mask = feature_dict_copy["noised_mask"].bool()
+                if use_reference_for_noised_context:
+                    reference_context_mask = context_mask
+                    design_coords_mask = inpaint_mask
+                else:
+                    reference_context_mask = context_mask & ~noised_mask
+                    design_coords_mask = inpaint_mask | (context_mask & noised_mask)
+                context_asym_ids = feature_dict_copy["asym_id"][reference_context_mask].unique()
+
+                context_structure: Structure | None = None
+                for asym_id in context_asym_ids:
+                    asym_id_mask = (feature_dict_copy["asym_id"] == asym_id) & pad_mask
+                    # 1. align structure w/ sidechains to context residues in feature_dict
+                    context_cropped_feat = crop_features(
+                        feature_dict_copy, token_mask=reference_context_mask & asym_id_mask
+                    )
+                    context_structure_chain = self.input_reference_structure.crop(
+                        ChainResidueRepr.from_string(ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP[asym_id.item()]),
+                        reset_residue_index=False,
+                    )
+                    context_structure_chain_aligned = context_structure_chain.align_to_feature_dict(
+                        feature_dict=context_cropped_feat, atoms_to_include=self.atoms_to_include
+                    )
+
+                    if context_structure is None:
+                        context_structure = context_structure_chain_aligned
+                    else:
+                        # The current design pipelines only support a single reference structure input
+                        # and it is assumed that the `entity_id`s are set appropriately.
+                        # Therefore, we do not need to guard against accidental collisions of `entity_id`s,
+                        # and we can support concatenating homo-oligomer chains that share an entity by
+                        # setting `enforce_distinct_entity_ids` to False.
+                        context_structure = context_structure.merge(
+                            context_structure_chain_aligned,
+                            mode="concatenate",
+                            reset_residue_index=False,
+                            enforce_distinct_entity_ids=False,
+                        )
+
+                inpaint_cropped_feat = crop_features(
+                    feature_dict_copy, token_mask=design_coords_mask, reset_residue_index=False
+                )
+                inpaint_structure = self.__class__(
+                    feature_dict=inpaint_cropped_feat,
+                    atoms_to_include=self.atoms_to_include,
+                    auth_chain_id_table=deepcopy(self.auth_chain_id_table),
+                ).to_structure()
+
+                if context_structure is None:
+                    structure = inpaint_structure
+
+                else:
+                    structure = inpaint_structure.merge(context_structure, mode="inpaint", reset_residue_index=False)
+
+            structures.append(structure)
+
+        return structures
 
     def to_structure(self) -> Structure:
         """Convert features dictionary to a Structure object.
@@ -176,6 +344,10 @@ class Features(BaseModel, Mapping):
         into a Structure that can be saved to a file.
         For backbone-only representations (N, CA, C), oxygen
         atoms are added to complete the backbone.
+
+        Residue order follows the feature dictionary. ``res_idx`` is always
+        filled from ``residue_index`` and ``auth_res_idx`` from
+        ``auth_residue_index``. Merge identity stays ``(asym_id, res_idx)``.
 
         The pocket_feature values are encoded in the B-factor field:
         - POCKET residues: 100.0
@@ -206,8 +378,11 @@ class Features(BaseModel, Mapping):
             n_residues = len(feature_dict_nopad_tensor["token_index"])
             bb_atom_names = AtomFilter.BB.to_atom_names() + ("O",)
             atom_names: np.ndarray = np.tile(np.array(bb_atom_names, dtype=np.str_), n_residues)
+        elif self.atoms_to_include == AtomFilter.CA:
+            n_residues = len(feature_dict_nopad_tensor["token_index"])
+            atom_names = np.tile(np.array(AtomFilter.CA.to_atom_names(), dtype=np.str_), n_residues)
         else:
-            raise NotImplementedError("Only BB atoms are supported")
+            raise NotImplementedError(f"atoms_to_include={self.atoms_to_include} is not supported")
 
         feature_dict_nopad = {key: value.numpy() for key, value in feature_dict_nopad_tensor.items()}
 
@@ -251,8 +426,13 @@ class Features(BaseModel, Mapping):
             is_present = (atoms["is_present"][:, None] & (feature_dict_nopad["atom_to_token"]).astype(bool)).any(axis=0)
             ca_present = feature_dict_nopad["token_resolved_mask"]
             backbone_present = feature_dict_nopad["frame_resolved_mask"]
+        elif self.atoms_to_include == AtomFilter.CA:
+            atom_center = token_to_atom_min_idx  # CA is the only atom per residue
+            is_present = atoms["is_present"].astype(bool)
+            ca_present = feature_dict_nopad["token_resolved_mask"]
+            backbone_present = feature_dict_nopad["frame_resolved_mask"]
         else:
-            raise NotImplementedError("Only BB atoms are supported")
+            raise NotImplementedError(f"atoms_to_include={self.atoms_to_include} is not supported")
 
         residue_dtype_input = {
             "res_type": feature_dict_nopad["res_type"],
@@ -279,6 +459,7 @@ class Features(BaseModel, Mapping):
 
         # Assign the chain information to the chains array
         unique_asym_ids = list(np.unique(feature_dict_nopad["asym_id"]))
+        auth_table = self.resolved_auth_chain_id_table()
         asym_id_to_auth_asym_id = {
             asym_id: auth_asym_id
             for asym_id, auth_asym_id in zip(
@@ -291,7 +472,10 @@ class Features(BaseModel, Mapping):
             "auth_asym_id": np.array([asym_id_to_auth_asym_id[asym_id] for asym_id in unique_asym_ids]),
             "chain_id": np.array([ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP[asym_id] for asym_id in unique_asym_ids]),
             "auth_chain_id": np.array(
-                [ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP[asym_id_to_auth_asym_id[asym_id]] for asym_id in unique_asym_ids]
+                [
+                    checked_auth_chain_id(lookup_auth_chain_id(asym_id_to_auth_asym_id[asym_id], auth_table))
+                    for asym_id in unique_asym_ids
+                ]
             ),
             "sym_id": np.array(
                 [
@@ -326,38 +510,26 @@ class Features(BaseModel, Mapping):
                 value = value.numpy()
             chains[key] = value
 
-        # features
-        if (
-            len(
-                set(feature_dict_nopad.keys())
-                & set(["binder_mask", "noised_mask", "pocket_feature", "inpaint_feature"])
-            )
-            == 4
-        ):
-            features_dtype_input = {
-                "is_designed": feature_dict_nopad["binder_mask"],
-                "is_noised": feature_dict_nopad["noised_mask"],
-                "pocket_feature": feature_dict_nopad["pocket_feature"],
-                "inpaint_feature": feature_dict_nopad["inpaint_feature"],
-            }
-            features = np.empty(len(feature_dict_nopad["binder_mask"]), dtype=DYNO_PSI_FEATURES_DTYPE)
-            for key, value in features_dtype_input.items():
-                if isinstance(value, torch.Tensor):
-                    value = value.numpy()
-                features[key] = value
-        else:
-            features = np.empty(len(feature_dict_nopad["token_index"]), dtype=DYNO_PSI_FEATURES_DTYPE)
-
         return Structure(
             atoms=atoms,
             residues=residues,
             chains=chains,
             interfaces=np.empty(0, dtype=CHAIN_INTERFACE_DTYPE),
             residue_interfaces=np.empty(0, dtype=RESIDUE_INTERFACE_DTYPE),
-            features=features,
+            features=np.empty(0, dtype=DYNO_PSI_FEATURES_DTYPE),
         )
 
-    def save_to_pdb(self, file_path: Path | str) -> None:
+    def resolved_auth_chain_id_table(self) -> dict[int, str]:
+        """Merge ``auth_chain_id_table`` with auth strings from ``input_reference_structure`` chains."""
+        tables: list[dict[int, str]] = []
+        if self.input_reference_structure is not None:
+            tables.append(auth_chain_id_table_from_chains(self.input_reference_structure.chains))
+        tables.append(self.auth_chain_id_table)
+        return merge_auth_chain_id_tables(tables)
+
+    def save_to_pdb(
+        self, file_path: Path | str, residue_index_type: Literal["residue_index", "auth_residue_index"]
+    ) -> None:
         """Save the features to a PDB file.
 
         Converts the internal feature dictionary to a Structure object
@@ -367,6 +539,11 @@ class Features(BaseModel, Mapping):
         ----------
         file_path : Path | str
             Destination file path. Must have a `.pdb` extension.
+        residue_index_type: Literal["residue_index", "auth_residue_index"]
+            Which Structure column to write as the file seqid. Mapped onto
+            ``save_structures_to_file`` ``primary_residue_index_key``:
+            ``residue_index`` -> ``res_idx``, ``auth_residue_index`` ->
+            ``auth_res_idx``.
 
         Raises
         ------
@@ -383,11 +560,17 @@ class Features(BaseModel, Mapping):
         """
         if file_path.lower().endswith(".pdb"):
             structure = self.to_structure()
-            save_structures_to_file([structure], file_path)
+            save_res_index_type = cast(
+                Literal["res_idx", "auth_res_idx"],
+                {"residue_index": "res_idx", "auth_residue_index": "auth_res_idx"}[residue_index_type],
+            )
+            save_structures_to_file([structure], file_path, primary_residue_index_key=save_res_index_type)
         else:
             raise ValueError(f"Invalid file path: {file_path}")
 
-    def save_to_mmcif(self, file_path: Path | str) -> None:
+    def save_to_mmcif(
+        self, file_path: Path | str, residue_index_type: Literal["residue_index", "auth_residue_index"]
+    ) -> None:
         """Save the features to an mmCIF file.
 
         Converts the internal feature representation to a Structure object
@@ -397,6 +580,11 @@ class Features(BaseModel, Mapping):
         ----------
         file_path : Path | str
             Destination file path. Must have a `.mmcif` or `.cif` extension.
+        residue_index_type: Literal["residue_index", "auth_residue_index"]
+            Which Structure column to write as the file seqid. Mapped onto
+            ``save_structures_to_file`` ``primary_residue_index_key``:
+            ``residue_index`` -> ``res_idx``, ``auth_residue_index`` ->
+            ``auth_res_idx``.
 
         Raises
         ------
@@ -410,7 +598,12 @@ class Features(BaseModel, Mapping):
         """
         if file_path.lower().endswith(".mmcif") or file_path.lower().endswith(".cif"):
             structure = self.to_structure()
-            save_structures_to_file([structure], file_path)
+            save_res_index_type = cast(
+                Literal["res_idx", "auth_res_idx"],
+                {"residue_index": "res_idx", "auth_residue_index": "auth_res_idx"}[residue_index_type],
+            )
+            save_structures_to_file([structure], file_path, primary_residue_index_key=save_res_index_type)
+
         else:
             raise ValueError(f"Invalid file path: {file_path}")
 
@@ -434,10 +627,12 @@ class Features(BaseModel, Mapping):
         --------
         to_structure : Converts features to a Structure object.
         data.structure.Structure.dump_to_npz : Underlying save implementation.
+
+        NOTE: This always writes sequential 0-based ``auth_res_idx`` per chain.
         """
         if file_path.lower().endswith(".npz"):
             structure = self.to_structure()
-            structure.dump_to_npz(file_path)
+            structure.with_sequential_auth_res_idx().dump_to_npz(file_path)
         else:
             raise ValueError(f"Invalid file path: {file_path}")
 
@@ -500,7 +695,7 @@ class Features(BaseModel, Mapping):
             return len(self.feature_dict["asym_id"])
 
 
-class Featurizer(BaseModel):
+class Featurizer(StrictConfig):
     """Base class for runtime featurization steps.
 
     Featurizer classes actually perform the featurization steps by

@@ -7,8 +7,10 @@ from dynopsi.data.featurization.inference_featurization_pipeline import (
 from dynopsi.data.featurization.primitives import (
     BinderRgCenterOfMassEstimator,
     CenterOfMassFeaturizer,
+    ChainIsLoopyConditioningFeaturizer,
     CropFeaturizer,
     DataAugmentationConfig,
+    FixedHotspotOffsetEstimator,
     HotspotFeaturizer,
     InpaintFeaturizer,
     NewChainsCentersOfMassFunctionType,
@@ -17,6 +19,8 @@ from dynopsi.data.featurization.primitives import (
     PredefinedCenterOfMassEstimator,
     PriorMeansConfig,
     ReferenceStructureFeaturizer,
+    SecondaryStructureConditioningFeaturizer,
+    SphereExclusionCenterEstimator,
 )
 from dynopsi.data.featurization.registry import register_featurizer
 
@@ -37,7 +41,11 @@ __all__ = [
     "DynoPsiBinderDesignFeaturizationPipeline",
     "BinderRgCenterOfMassEstimator",
     "PredefinedCenterOfMassEstimator",
+    "FixedHotspotOffsetEstimator",
+    "SphereExclusionCenterEstimator",
     "NewChainsCentersOfMassFunctionType",
     "DataAugmentationConfig",
     "PriorMeansConfig",
+    "ChainIsLoopyConditioningFeaturizer",
+    "SecondaryStructureConditioningFeaturizer",
 ]

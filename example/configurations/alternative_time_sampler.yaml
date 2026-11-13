@@ -7,11 +7,17 @@ featurization_pipelines:
             crop_17_209: B17-209
         hotspots:
             hotspot_58V_80L_139Y: B58,B80,B139
+        binder_atoms_to_include: bb
+        design_conditioning:
+            chain_is_loopy:
+                non_loopy: NON_LOOP
+            has_homooligomer_partner:
+                no_partner: NO_PARTNER
         new_chains_lengths: [60, 80, 100, 120]
         new_chains_centers_of_mass:
-                il7center:
-                    type: predefined_center_of_mass
-                    centers_of_mass: [[28.1, 41.4, 47.9]]
+            il7center:
+                type: predefined_center_of_mass
+                centers_of_mass: [[28.1, 41.4, 47.9]]
 
 simulation_pipelines:
     sde_100_steps_logtime:
@@ -27,24 +33,23 @@ simulation_pipelines:
         noise_scale_fn:
             type: constant
             constant: 0.1
-        score_scale_fn:
+        ode_warmup_score_scale_fn:
+            type: constant
+            constant: 1.0
+        ode_warmup_max_t: 0.0
+        ode_cooldown_score_scale_fn:
             type: constant
             constant: 1.5
-        t_thresh_score_weighting_only: 0.9
+        ode_cooldown_min_t: 0.9
 
 output_specifications:
     default_output_specification:
         output_dir: ./example/output
-        formats: [pdb, npz]
+        formats: [mmcif, npz]
         save_trajectory: False
 
 design_pipelines:
     il7ra_3di3_binder_design:
-        type: dynopsi_binder_design_pipeline
         featurization_pipeline: il7ra_3di3_binder_design
         simulation_pipeline: sde_100_steps_logtime
         output_specification: default_output_specification
-
-
-
-        

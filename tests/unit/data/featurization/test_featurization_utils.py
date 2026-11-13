@@ -4,13 +4,67 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from dynopsi.data.constants import AtomFilter, InpaintFeature, PocketFeature
+from dynopsi.data.auth_chain_identity import OPAQUE_AUTH_ASYM_ID_START
+from dynopsi.data.constants import (
+    AtomFilter,
+    DSSPLoopFeature,
+    HomooligomerPartnerFeature,
+    InpaintFeature,
+    PocketFeature,
+)
 from dynopsi.data.featurization.utils import (
+    TOKEN_KEYS_FLAT,
     concat_features,
+    concat_features_with_auth_tables,
     crop_features,
     make_empty_chain,
+    pad_features,
     strip_chain_padding,
 )
+
+
+class TestConditioningFeatureKeys:
+    def test_registry_keys_are_token_keys(self) -> None:
+        assert "chain_is_loopy" in TOKEN_KEYS_FLAT
+        assert "has_homooligomer_partner" in TOKEN_KEYS_FLAT
+
+    def test_pad_features_supports_chain_is_loopy(self) -> None:
+        features = {
+            "token_index": torch.arange(2),
+            "chain_is_loopy": torch.tensor([DSSPLoopFeature.NON_LOOP, DSSPLoopFeature.LOOP_OR_OTHER]),
+        }
+
+        output = pad_features(features, max_tokens=4, atoms_to_include=AtomFilter.CA)
+
+        assert output["chain_is_loopy"].tolist() == [
+            int(DSSPLoopFeature.NON_LOOP),
+            int(DSSPLoopFeature.LOOP_OR_OTHER),
+            int(DSSPLoopFeature.MASK_OR_MISSING),
+            int(DSSPLoopFeature.MASK_OR_MISSING),
+        ]
+
+    def test_pad_features_supports_has_homooligomer_partner(self) -> None:
+        features = {
+            "token_index": torch.arange(2),
+            "has_homooligomer_partner": torch.tensor(
+                [HomooligomerPartnerFeature.NO_PARTNER, HomooligomerPartnerFeature.HAS_PARTNER]
+            ),
+        }
+
+        output = pad_features(features, max_tokens=4, atoms_to_include=AtomFilter.CA)
+
+        assert output["has_homooligomer_partner"].tolist() == [
+            int(HomooligomerPartnerFeature.NO_PARTNER),
+            int(HomooligomerPartnerFeature.HAS_PARTNER),
+            int(HomooligomerPartnerFeature.MASK_OR_MISSING),
+            int(HomooligomerPartnerFeature.MASK_OR_MISSING),
+        ]
+
+    def test_pad_features_rejects_unknown_key(self) -> None:
+        features = {"token_index": torch.arange(2), "not_a_registered_feature": torch.zeros(2)}
+
+        with pytest.raises(ValueError, match="Unsupported key"):
+            pad_features(features, max_tokens=4, atoms_to_include=AtomFilter.CA)
 
 
 class TestStripChainPadding:
@@ -243,6 +297,75 @@ class TestConcatFeatures:
                 make_asym_ids_unique=False,
                 make_entity_ids_unique=False,
             )
+
+
+class TestConcatFeaturesWithAuthTables:
+    def test_colliding_opaque_a7_tables_stay_distinct(self) -> None:
+        first = make_empty_chain(
+            seq_length=2,
+            atoms_to_include=AtomFilter.BB,
+            res_type="ALA",
+            asym_id=0,
+            auth_asym_id=OPAQUE_AUTH_ASYM_ID_START,
+        )
+        second = make_empty_chain(
+            seq_length=2,
+            atoms_to_include=AtomFilter.BB,
+            res_type="ALA",
+            asym_id=0,
+            auth_asym_id=OPAQUE_AUTH_ASYM_ID_START,
+        )
+        tables = [
+            {OPAQUE_AUTH_ASYM_ID_START: "A-7"},
+            {OPAQUE_AUTH_ASYM_ID_START: "A-7"},
+        ]
+        out, merged = concat_features_with_auth_tables(
+            [first, second],
+            tables,
+            make_asym_ids_unique=True,
+            make_entity_ids_unique=True,
+        )
+        auth_ints = {int(i) for i in out["auth_asym_id"].unique().tolist()}
+        assert auth_ints == {OPAQUE_AUTH_ASYM_ID_START, OPAQUE_AUTH_ASYM_ID_START + 1}
+        assert merged == {OPAQUE_AUTH_ASYM_ID_START: "A-7", OPAQUE_AUTH_ASYM_ID_START + 1: "A-7"}
+        assert tables == [
+            {OPAQUE_AUTH_ASYM_ID_START: "A-7"},
+            {OPAQUE_AUTH_ASYM_ID_START: "A-7"},
+        ]
+
+    def test_forwards_reset_residue_index(self) -> None:
+        first = make_empty_chain(
+            seq_length=2,
+            atoms_to_include=AtomFilter.BB,
+            res_type="ALA",
+            asym_id=0,
+            auth_asym_id=0,
+        )
+        second = make_empty_chain(
+            seq_length=2,
+            atoms_to_include=AtomFilter.BB,
+            res_type="ALA",
+            asym_id=1,
+            auth_asym_id=1,
+        )
+        first["residue_index"] = torch.tensor([5, 6], dtype=torch.long)
+        second["residue_index"] = torch.tensor([10, 11], dtype=torch.long)
+        tables = [{0: "A"}, {1: "B"}]
+        reset_out, _ = concat_features_with_auth_tables(
+            [first, second],
+            tables,
+            make_asym_ids_unique=True,
+            make_entity_ids_unique=True,
+        )
+        keep_out, _ = concat_features_with_auth_tables(
+            [first, second],
+            tables,
+            make_asym_ids_unique=True,
+            make_entity_ids_unique=True,
+            reset_residue_index=False,
+        )
+        assert reset_out["residue_index"].tolist() == [0, 1, 0, 1]
+        assert keep_out["residue_index"].tolist() == [5, 6, 10, 11]
 
 
 class TestCropFeatures:

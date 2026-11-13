@@ -2,6 +2,35 @@ import einops
 import torch
 
 
+def slice_coords_by_frames_idx(coords: torch.Tensor, frames_idx: torch.Tensor, num_atoms: int) -> torch.Tensor:
+    """Gather backbone atom coordinates using frames_idx.
+
+    Parameters
+    ----------
+    coords : torch.Tensor
+        Full atom coordinates, shape (batch_size, 1, all_atoms, 3).
+    frames_idx : torch.Tensor
+        Indices of N, CA, C backbone atoms for each residue, shape (batch_size, seq_len, 3).
+    num_atoms : int
+        Atoms to return: 3 → N/CA/C backbone, 1 → CA only.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape (batch_size, seq_len, num_atoms * 3).
+    """
+    batch_size = frames_idx.shape[0]
+    seq_len = frames_idx.shape[1]
+    frames_idx_expand = frames_idx.reshape(batch_size, 1, -1, 1).expand(-1, -1, -1, 3)
+    backbone_coords = torch.gather(coords, dim=2, index=frames_idx_expand).reshape(batch_size, seq_len, -1)
+    if num_atoms == 3:
+        return backbone_coords
+    elif num_atoms == 1:
+        return backbone_coords.view(batch_size, seq_len, 3, 3)[:, :, 1, :]
+    else:
+        raise ValueError(f"Unsupported num_atoms={num_atoms}; supported values are 1 and 3")
+
+
 def kabsch_torch(P: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
     """
     Return the optimal rotation R that minimizes ||PR - Q||_F.

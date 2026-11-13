@@ -43,6 +43,11 @@ class GaussianSDEStepUpdate(Op):
         low-temperature sampling. See dynopsi.utils.function_configs SingleParameterFunctionType for available functions.
     out_x_loc_store : str
         Store key for output state (written at step_num + 1; advanced state for next step).
+    prior_stds: dict[str, float]
+        Mapping from modality to standard deviation of isotropic Gaussian prior.
+    use_legacy_cvf_score_conversion: bool
+        If False, then conditional score is computed as score_t = (t * cvf_t - x_t) / (prior_std**2 * (1 - t)).
+        If True, then conditional score is computed as score_t = (t * cvf_t - x_t) / (1 - t).
     """
 
     type: Literal["gaussian_sde_update"] = "gaussian_sde_update"
@@ -55,6 +60,10 @@ class GaussianSDEStepUpdate(Op):
     diffusion_coefficient_fn: SingleParameterFunctionType
     noise_scale_fn: SingleParameterFunctionType
     out_x_loc_store: str
+    prior_stds: dict[str, float]
+    use_legacy_cvf_score_conversion: bool
+    manually_seed_step: bool = False
+
     # for saving intermediate terms
     save_intermediate_terms: bool
     drift_terms_loc_store: str = Field(default="drift_terms")
@@ -62,9 +71,9 @@ class GaussianSDEStepUpdate(Op):
     noise_terms_loc_store: str = Field(default="noise_terms")
 
     def input_state_keys(self, step_num: int) -> set[str]:
-        if is_active_at(self.valid_steps, step_num):
-            return {self.in_x_loc_store, self.in_cvf_loc_store}
-        return set()
+        if not is_active_at(self.valid_steps, step_num):
+            return set()
+        return {self.in_x_loc_store, self.in_cvf_loc_store}
 
     def output_state_keys(self, step_num: int) -> set[str]:
         # We write to step_num + 1, but is_active_at tracks step_num. Therefore,
@@ -72,6 +81,17 @@ class GaussianSDEStepUpdate(Op):
         if is_active_at(self.valid_steps, step_num - 1):
             return {self.out_x_loc_store}
         return set()
+
+    def get_output_step(self, input_step_num: int) -> int | None:
+        if is_active_at(self.valid_steps, input_step_num):
+            return input_step_num + 1
+        return None
+
+    def intermediate_observable_keys(self) -> set[str]:
+        if self.save_intermediate_terms:
+            return {self.drift_terms_loc_store, self.score_terms_loc_store, self.noise_terms_loc_store}
+        else:
+            return set()
 
     def brownian_increment(self, dt: torch.Tensor) -> torch.Tensor:
         """
@@ -92,20 +112,26 @@ class GaussianSDEStepUpdate(Op):
         current_state: torch.Tensor,
         cvf: torch.Tensor,
         time: torch.Tensor,
+        prior_std: torch.Tensor,
     ) -> torch.Tensor:
         """
         Compute score given the vector field learned by flow matching
 
-        s(x_t, t) = (t * v(x_t, t) - x_t) / (1 - t)
+        s(x_t, t) = (t * v(x_t, t) - x_t) / (prior_std**2 * (1 - t))
 
         Parameters
         ----------
         current_state: torch.Tensor, the x_t, shape (bs, L, d)
         cvf: torch.Tensor, prediction of learned vector field v(x_t, t), shape (bs, L, d)
         time: torch.Tensor, shape (bs, 1, 1)
+        prior_std: torch.Tensor, shape (bs, 1, 1)
+            Prior standard deviation for the current modality.
         """
         assert torch.all(time < 1.0)
-        return (time * cvf - current_state) / (1.0 - time)
+        if self.use_legacy_cvf_score_conversion:
+            return (time * cvf - current_state) / (1.0 - time)
+        else:
+            return (time * cvf - current_state) / (prior_std**2 * (1.0 - time))
 
     def get_sde_update_terms(
         self,
@@ -113,9 +139,10 @@ class GaussianSDEStepUpdate(Op):
         cvf: torch.Tensor,
         time: torch.Tensor,
         dt: torch.Tensor,
+        prior_std: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Update the state using the SDE update."""
-        score = self.vector_field_to_score(current_state, cvf, time)  # bs, L, d
+        score = self.vector_field_to_score(current_state, cvf, time, prior_std)  # bs, L, d
         diffusion_coefficient_term = self.diffusion_coefficient_fn(time)  # bs, 1, 1
         noise_scale = self.noise_scale_fn(time)  # bs, 1, 1
 
@@ -132,6 +159,8 @@ class GaussianSDEStepUpdate(Op):
         store: Store,
         step_num: int,
     ) -> None:
+        if self.manually_seed_step:
+            torch.manual_seed(step_num)
 
         valid_modalities = valid_modalities_at(self.valid_steps, step_num)
         if len(valid_modalities) == 0:
@@ -148,6 +177,10 @@ class GaussianSDEStepUpdate(Op):
         batch_size = x_in[valid_modalities[0]].shape[0]
         times = {modality: store.get_time(step_num, modality, batch_size) for modality in valid_modalities}
         dts = {modality: store.get_timestep_size(step_num, modality, batch_size) for modality in valid_modalities}
+        prior_stds = {
+            modality: torch.full_like(input=times[modality], fill_value=self.prior_stds[modality])
+            for modality in valid_modalities
+        }
 
         x_out = {}
         if self.save_intermediate_terms:
@@ -157,16 +190,18 @@ class GaussianSDEStepUpdate(Op):
 
         for modality in valid_modalities:
             drift_term, score_term, noise_term = self.get_sde_update_terms(
-                x_in[modality], cvf_in[modality], times[modality], dts[modality]
+                x_in[modality], cvf_in[modality], times[modality], dts[modality], prior_stds[modality]
             )
-            x_step = drift_term
+            x_step = drift_term.clone()
             x_step[noised_mask] = (drift_term + score_term + noise_term)[noised_mask]
 
             x_out[modality] = x_in[modality] + x_step
 
             if self.save_intermediate_terms:
                 drift_terms[modality] = drift_term
+                score_term[~noised_mask] = float("nan")
                 score_terms[modality] = score_term
+                noise_term[~noised_mask] = float("nan")
                 noise_terms[modality] = noise_term
 
         store.put(self.out_x_loc_store, x_out, step_num + 1)

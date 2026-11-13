@@ -323,3 +323,146 @@ class EuclideanInterpolant(Interpolant):
             Point on the trajectory at time `t+dt`, shape (batch_size, L, d).
         """
         return xt + ut * dt
+
+
+class FisherInterpolant(Interpolant):
+    """Implement the interpolant for Fisher flow matching from Davis, et al. (2024).
+
+    This is ultimately just Riemannian flow matching on the positive orthant of the unit sphere.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the Fisher interpolant."""
+        import geoopt  # type: ignore[import-not-found]  # optional; not a base dependency
+
+        self.sphere = geoopt.Sphere()
+
+    def _exp_map(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Exponential map on the sphere.
+
+        _exp_map(x, v) corresponds to exp_x(v) in usual differential geometry notation.
+        The exponential maps a tangent vector v at x to a point on the manifold that follwos
+        the geodesic starting at x with velocity v.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Point on the manifold, shape (batch_size, L, d).
+        v : torch.Tensor
+            Tangent vector, shape (batch_size, L, d).
+        """
+        return self.sphere.expmap(x, v)
+
+    def _log_map(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Log map on the sphere.
+
+        _log_map(x, y) corresponds to log_x(y) in usual differential geometry notation.
+        The log map maps a point y on the manifold to a tangent vector at x that is the velocity
+        of the geodesic starting at x and ending at y.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Point on the manifold, shape (batch_size, L, d).
+        y : torch.Tensor
+            Point on the manifold, shape (batch_size, L, d).
+        """
+        return self.sphere.logmap(x, y)
+
+    def interpolate(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Perform interpolation along the geodesic between x0 and x1.
+
+        The is done by calculating exp_x0(t * log_x0(x1)) and projecting onto the positive orthant.
+
+        Parameters
+        ----------
+        x0 : torch.Tensor
+            Samples from the prior (noise) distribution, shape (batch_size, L, d).
+        x1 : torch.Tensor
+            Clean samples from the data distribution, shape (batch_size, L, d).
+        t : torch.Tensor
+            Time, shape (batch_size, 1, 1).
+
+        Returns
+        -------
+        torch.Tensor
+            Interpolated point, shape (batch_size, L, d).
+        """
+        x_ = self._exp_map(x0, self._log_map(x0, x1) * t)
+        return self.sphere.projx(x_).abs()  # project onto positive orthant
+
+    def conditional_vector_field(
+        self,
+        xt: torch.Tensor,
+        x1: torch.Tensor,
+        t: torch.Tensor,
+        x0: torch.Tensor | None = None,
+        eps: float | None = 1e-1,
+    ) -> torch.Tensor:
+        """Evaluate the conditional vector field u_t(xt|x1).
+
+        In Davis, et al. (2024), the conditional vector field is defined as:
+            u_t(x|x0, x1) = log_{xt}(x1) / (1-t)
+
+        Parameters
+        ----------
+        xt : torch.Tensor
+            Interpolated states between prior and data samples, shape (batch_size, L, d).
+        x1 : torch.Tensor
+            Clean samples from the data distribution, shape (batch_size, L, d).
+        t : torch.Tensor
+            Time, shape (batch_size, 1, 1).
+        x0 : torch.Tensor | None
+            Samples from the prior (noise) distribution, shape (batch_size, L, d).
+        eps : float, optional
+            Small value to avoid division by zero, by default 1e-1.
+            Default matches the default clip value in FrameFlow for the time reweighting term to prevent exploding gradients.
+
+        Returns
+        -------
+        torch.Tensor
+            Conditional vector field, shape (batch_size, L, d).
+        """
+        if x0 is not None:
+            v = self._log_map(x0, x1)
+            return self.sphere.transp(x0, xt, v)
+        else:
+            denominator = 1 - t
+            if eps is not None:
+                denominator = denominator.clamp_min(min=eps)
+            return self._log_map(xt, x1) / denominator
+
+    def apply_conditional_vector_field(self, xt: torch.Tensor, ut: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        """Apply the conditional vector field u_t(xt|x1) to `xt` with a step size of `dt` to obtain `x(t+dt)`.
+
+        Parameters
+        ----------
+        xt : torch.Tensor
+            Interpolated states between prior and data samples, shape (batch_size, L, d).
+        ut : torch.Tensor
+            Conditional vector field, shape (batch_size, L, d).
+        dt : torch.Tensor
+            Step size, shape (batch_size, 1, 1).
+
+        Returns
+        -------
+        torch.Tensor
+            Point on the trajectory at time `t+dt`, shape (batch_size, L, d).
+        """
+        x_ = self._exp_map(xt, ut * dt)
+        return self.sphere.projx(x_).abs()
+
+    def calc_clean_data_loss_weight(self, time_samples: torch.Tensor) -> torch.Tensor:
+        """Calculate the time-dependent weight required when using clean data prediction loss.
+
+        Parameters
+        ----------
+        time_samples : torch.Tensor
+            Time samples, shape (batch_size, 1, 1).
+
+        Returns
+        -------
+        torch.Tensor
+            Time-dependent weight, shape (batch_size, 1, 1).
+        """
+        return 1 / (1 - time_samples) ** 2

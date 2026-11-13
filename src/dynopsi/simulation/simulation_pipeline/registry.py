@@ -1,15 +1,17 @@
 from collections.abc import Callable
-from typing import Any, get_args, get_type_hints
+from typing import Any, TypeVar, get_args, get_type_hints
 
 from dynopsi.simulation import Simulation
 
 SIMULATION_PIPELINE_REGISTRY: dict[str, type[Simulation]] = {}
 
+_SimT = TypeVar("_SimT", bound=Simulation)
 
-def register_simulation_pipeline(overwrite: bool = False) -> Callable[[type[Simulation]], type[Simulation]]:
+
+def register_simulation_pipeline(overwrite: bool = False) -> Callable[[type[_SimT]], type[_SimT]]:
     """Register a simulation pipeline class with the registry."""
 
-    def register_decorator(simulation_pipeline: type[Simulation]) -> type[Simulation]:
+    def register_decorator(simulation_pipeline: type[_SimT]) -> type[_SimT]:
         # obtain the type of the simulation pipeline
         type_hints = get_type_hints(simulation_pipeline)
         type_literal = get_args(type_hints["type"])

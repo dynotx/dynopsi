@@ -1,5 +1,3 @@
-"""Verify featurizations."""
-
 import os
 import pickle
 
@@ -19,6 +17,7 @@ featurization_pipelines = {
     # Verify some correct specifications for multiple targets
     "il7ra_3di3": {
         idx_type: DynoPsiBinderDesignFeaturizationPipeline(
+            binder_atoms_to_include=AtomFilter.BB,
             name="il7ra_3di3_binder_design",
             index_type=idx_type,
             rcsb_record_id="3di3",
@@ -36,6 +35,7 @@ featurization_pipelines = {
     },
     "pdl1_5o45": {
         idx_type: DynoPsiBinderDesignFeaturizationPipeline(
+            binder_atoms_to_include=AtomFilter.BB,
             name="pdl1_5o45_binder_design",
             index_type=idx_type,
             rcsb_record_id="5o45",
@@ -55,6 +55,7 @@ featurization_pipelines = {
     },
     "insulinr_4zxb": {
         idx_type: DynoPsiBinderDesignFeaturizationPipeline(
+            binder_atoms_to_include=AtomFilter.BB,
             name="insulinr_4zxb_binder_design",
             index_type=idx_type,
             rcsb_record_id="4zxb",
@@ -72,6 +73,7 @@ featurization_pipelines = {
     },
     "sc2rbd_6m0j": {
         idx_type: DynoPsiBinderDesignFeaturizationPipeline(
+            binder_atoms_to_include=AtomFilter.BB,
             name="sc2rbd_6m0j_binder_design",
             index_type=idx_type,
             rcsb_record_id="6m0j",
@@ -89,6 +91,7 @@ featurization_pipelines = {
     },
     "trka_1www": {
         idx_type: DynoPsiBinderDesignFeaturizationPipeline(
+            binder_atoms_to_include=AtomFilter.BB,
             name="trka_1www_binder_design",
             index_type=idx_type,
             rcsb_record_id="1www",
@@ -106,6 +109,7 @@ featurization_pipelines = {
     },
     "vegfa_1bj1": {
         idx_type: DynoPsiBinderDesignFeaturizationPipeline(
+            binder_atoms_to_include=AtomFilter.BB,
             name="vegfa_1bj1_binder_design",
             index_type=idx_type,
             rcsb_record_id="1bj1",
@@ -126,6 +130,7 @@ featurization_pipelines = {
     # Also test AFDB option
     "pdl1_afdb": {
         "auth_residue_index": DynoPsiBinderDesignFeaturizationPipeline(
+            binder_atoms_to_include=AtomFilter.BB,
             name="pdl1_Q9NZQ7_binder_design",
             index_type="auth_residue_index",
             afdb_uniprot_id="Q9NZQ7",
@@ -142,6 +147,7 @@ featurization_pipelines = {
     # Also test local structure path option
     "trka_local": {
         "auth_residue_index": DynoPsiBinderDesignFeaturizationPipeline(
+            binder_atoms_to_include=AtomFilter.BB,
             name="trka_local_cif",
             index_type="auth_residue_index",
             structure_path=f"{os.path.dirname(os.path.abspath(__file__))}/../test_files/1www_pdb_X_282_382.cif",
@@ -153,22 +159,6 @@ featurization_pipelines = {
             },
         )
     },
-    # Also purposefully verify what happens when making a mistake in specification.
-    # This mistake should be visible in the output structures produced for verification.
-    "il7ra_mistaken_index_type": {
-        "mistaken_index_type": DynoPsiBinderDesignFeaturizationPipeline(
-            name="il7ra_mistaken_index_type",
-            index_type="auth_residue_index",
-            rcsb_record_id="3di3",
-            # Use different crop and hotspot than the correct ones to avoid clobbering
-            crops={"crop_B22_212": "B22-212"},
-            hotspots={"hotspot_VY": "B62,B143"},
-            new_chains_lengths=LENGTHS,
-            new_chains_centers_of_mass={
-                "il7center": primitives.PredefinedCenterOfMassEstimator(centers_of_mass=[(28.1, 41.4, 47.9)]),
-            },
-        )
-    },
 }
 
 
@@ -177,6 +167,7 @@ def test_invalid_featurization_pipelines():
     shared_kwargs = dict(
         name="vegfa_invalid",
         index_type="auth_residue_index",
+        binder_atoms_to_include=AtomFilter.BB,
         new_chains_lengths=LENGTHS,
         new_chains_centers_of_mass={
             "testvibecenter": primitives.PredefinedCenterOfMassEstimator(
@@ -227,7 +218,25 @@ def test_invalid_featurization_pipelines():
     except ValueError:
         n_catches += 1
 
-    assert n_catches == 4
+    try:
+        # Residue positions from a different index type
+        featurization_pipeline = DynoPsiBinderDesignFeaturizationPipeline(
+            binder_atoms_to_include=AtomFilter.BB,
+            name="il7ra_mistaken_index_type",
+            index_type="auth_residue_index",
+            rcsb_record_id="3di3",
+            crops={"crop_B22_212": "B22-212"},
+            hotspots={"hotspot_VY": "B62,B143"},
+            new_chains_lengths=LENGTHS,
+            new_chains_centers_of_mass={
+                "il7center": primitives.PredefinedCenterOfMassEstimator(centers_of_mass=[(28.1, 41.4, 47.9)]),
+            },
+        )
+        next(featurization_pipeline([Features(atoms_to_include=AtomFilter.BB)]))
+    except ValueError:
+        n_catches += 1
+
+    assert n_catches == 5
 
 
 def test_structure_equality(struct1: Structure, struct2: Structure):
@@ -269,7 +278,8 @@ if __name__ == "__main__":
         feature_dicts = []
         for idx_name, featurization_pipeline in feat_pipelines.items():
             print(f"Featurizing {idx_name}")
-            for features in featurization_pipeline([Features(atoms_to_include=AtomFilter.BB)]):
+            for features_dict in featurization_pipeline([Features(atoms_to_include=AtomFilter.BB)]):
+                features = features_dict["features"]
                 structs.append(features.input_reference_structure)
                 feature_dicts.append(features.feature_dict)
 
@@ -279,9 +289,15 @@ if __name__ == "__main__":
 
         # just save the last of each idx type for visualization
         # this is whatever is currently "features"
-        feat_name = featurization_pipeline.get_featurization_name(features)
-        features.save_to_mmcif(f"{REF_FEAT_DIR}/{feat_name}.cif")
-        features.save_to_pdb(f"{REF_FEAT_DIR}/{feat_name}.pdb")
+        feat_name = featurization_pipeline.get_featurization_name(features_dict)
+        features.save_to_mmcif(
+            f"{REF_FEAT_DIR}/{feat_name}.cif",
+            residue_index_type="auth_residue_index",
+        )
+        features.save_to_pdb(
+            f"{REF_FEAT_DIR}/{feat_name}.pdb",
+            residue_index_type="auth_residue_index",
+        )
         output_features[feat_name] = features.feature_dict
         if features.input_reference_structure is not None:
             outpath = os.path.join(BASE_STRUCTURE_DIR, f"{feat_name}_input_structure.npz")
@@ -292,10 +308,12 @@ if __name__ == "__main__":
             save_structures_to_file(
                 [features.input_reference_structure],
                 os.path.join(BASE_STRUCTURE_DIR, f"{feat_name}_input_structure.pdb"),
+                primary_residue_index_key="auth_res_idx",
             )
             save_structures_to_file(
                 [features.input_reference_structure],
                 os.path.join(BASE_STRUCTURE_DIR, f"{feat_name}_input_structure.cif"),
+                primary_residue_index_key="auth_res_idx",
             )
 
         n_saved += 1

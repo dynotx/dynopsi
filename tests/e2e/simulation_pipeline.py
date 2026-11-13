@@ -6,9 +6,10 @@ import os
 
 import torch
 
+from dynopsi.data.constants import AtomFilter, DSSPLoopFeature, HomooligomerPartnerFeature
 from dynopsi.data.featurization import Features, primitives
 from dynopsi.data.featurization.inference_featurization_pipeline import DynoPsiBinderDesignFeaturizationPipeline
-from dynopsi.model.model_config import DynoPsiModelConfig
+from dynopsi.model.model_config import DEFAULT_DYNOPSI_MODEL_CONFIG, DynoPsiModelConfig
 from dynopsi.simulation import LinearTimeSampler, LogTimeSampler
 from dynopsi.simulation.observable import ObservableOutputConfig
 from dynopsi.simulation.simulation_pipeline.ode_simulation import ODESimulation
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 FEATURIZATION_PIPELINES: dict[str, DynoPsiBinderDesignFeaturizationPipeline] = {
     "vegfa_1bj1": DynoPsiBinderDesignFeaturizationPipeline(
         name="vegfa_1bj1",
+        binder_atoms_to_include=AtomFilter.BB,
         index_type="auth_residue_index",
         rcsb_record_id="1bj1",
         crops={
@@ -34,9 +36,14 @@ FEATURIZATION_PIPELINES: dict[str, DynoPsiBinderDesignFeaturizationPipeline] = {
                 centers_of_mass=[[32.0603, -6.7852173, 29.20792]]
             ),
         },
+        design_conditioning={
+            "chain_is_loopy": {"non_loopy": DSSPLoopFeature.NON_LOOP},
+            "has_homooligomer_partner": {"no_partner": HomooligomerPartnerFeature.NO_PARTNER},
+        },
     ),
     "il7ra_3di3": DynoPsiBinderDesignFeaturizationPipeline(
         name="il7ra_3di3_binder_design",
+        binder_atoms_to_include=AtomFilter.BB,
         index_type="auth_residue_index",
         rcsb_record_id="3di3",
         crops={"crop_17_209": "B17-209"},
@@ -44,6 +51,10 @@ FEATURIZATION_PIPELINES: dict[str, DynoPsiBinderDesignFeaturizationPipeline] = {
         new_chains_lengths=[60],
         new_chains_centers_of_mass={
             "il7center": primitives.PredefinedCenterOfMassEstimator(centers_of_mass=[[28.1, 41.4, 47.9]]),
+        },
+        design_conditioning={
+            "chain_is_loopy": {"non_loopy": DSSPLoopFeature.NON_LOOP},
+            "has_homooligomer_partner": {"no_partner": HomooligomerPartnerFeature.NO_PARTNER},
         },
     ),
 }
@@ -54,10 +65,10 @@ OBSERVABLE_OUTPUT_CONFIGS: dict[str, ObservableOutputConfig] = {
 }
 
 
-INFERENCE_MODEL_CONFIG: DynoPsiModelConfig = DynoPsiModelConfig(repo_id="dynotx/dynopsi", filename="dynopsi-1.ckpt")
+INFERENCE_MODEL_CONFIG: DynoPsiModelConfig = DEFAULT_DYNOPSI_MODEL_CONFIG
 
 DIFFUSION_COEFFICIENT_FUNCTIONS: dict[str, SingleParameterFunctionType] = {
-    "eps=0.0": InverseParameterFunction(eps=0.0),
+    "eps=0.0": InverseParameterFunction(eps=0.0, clamp_max=10.0),
     "eps=0.1": InverseParameterFunction(eps=0.1),
     "eps=1.0": InverseParameterFunction(eps=1.0),
 }
@@ -95,9 +106,8 @@ if __name__ == "__main__":
     # SYSTEM SETUP
     run_ode_simulation = args.run_ode_simulation
     run_sde_simulation = args.run_sde_simulation
-    device_names = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
-    devices = [torch.device(device_name) for device_name in device_names]
-    batch_size = infer_batch_size(devices)
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    batch_size = infer_batch_size(device)
     observable_output_configs = OBSERVABLE_OUTPUT_CONFIGS
     inference_model_config = INFERENCE_MODEL_CONFIG
 
@@ -120,11 +130,11 @@ if __name__ == "__main__":
                 features_save_dir = os.path.join(base_output_dir, ode_simulation_name, featurization_name)
                 os.makedirs(features_save_dir, exist_ok=True)
                 ode_simulation.run(
-                    {"features": features},
+                    features,
                     features_save_dir,
                     num_samples=num_samples,
                     batch_size=batch_size,
-                    devices=devices,
+                    device=device,
                 )
 
             # Create SDE simulations
@@ -142,8 +152,9 @@ if __name__ == "__main__":
                                 additional_sde_kwargs = dict(
                                     diffusion_coefficient_fn=diffusion_coefficient_function,
                                     noise_scale_fn=noise_scale_function,
-                                    score_scale_fn=score_scale_function,
-                                    t_thresh_score_weighting_only=t_thresh_score_only_value,
+                                    ode_warmup_max_t=-1,
+                                    ode_cooldown_score_scale_fn=score_scale_function,
+                                    ode_cooldown_min_t=t_thresh_score_only_value,
                                 )
                                 sde_simulation_name = (
                                     f"sde_{time_sampler_name}"
@@ -161,9 +172,9 @@ if __name__ == "__main__":
                                 os.makedirs(features_save_dir, exist_ok=True)
                                 print(f"SDE SIMULATION: {sde_simulation_name}")
                                 sde_simulation.run(
-                                    {"features": features},
+                                    features,
                                     features_save_dir,
                                     num_samples=num_samples,
                                     batch_size=batch_size,
-                                    devices=devices,
+                                    device=device,
                                 )

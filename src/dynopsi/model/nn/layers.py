@@ -1,4 +1,4 @@
-"""Portions of this file are derived from the OpenFold and La Proteina projects.
+"""Portions of this file are derived from the OpenFold, La Proteina, and Flash IPA projects.
 
 OpenFold
 Copyright (c) 2024 AlQuraishi Laboratory
@@ -10,18 +10,46 @@ Copyright (c) 2025 NVIDIA
 Licensed under the Apache License, Version 2.0.
 Source: https://github.com/NVIDIA-Digital-Bio/la-proteina
 
-Modifications to the OpenFold and La Proteina derived code were made by Dyno Therapeutics, Inc. (2026).
+Flash IPA
+Copyright (c) 2025 anonymous
+Licensed under the MIT License.
+Source: https://github.com/flagshippioneering/flash_ipa
+
+Modifications to the third-party derived code were made by Dyno Therapeutics, Inc. (2026).
 """
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from functools import partialmethod
+from functools import partial, partialmethod
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
-from dynopsi.model.nn.primitives import LayerNorm, Linear, SwiGLU
+from dynopsi.model.nn.primitives import (
+    LayerNorm,
+    Linear,
+    SwiGLU,
+)
+
+# use_reentrant=False is required for DDP compatibility.
+# determinism_check="none" suppresses a false-positive metadata mismatch error that
+# arises from the bfloat16 autocast context interaction in LayerNorm on PyTorch 2.6+.
+checkpoint = partial(_checkpoint, use_reentrant=False, determinism_check="none")
+
+
+def _is_fp16_enabled() -> bool:
+    """Check if FP16 precision is enabled.
+
+    Implementation taken without modification from OpenFold precision_utils:
+    https://github.com/aqlaboratory/openfold/blob/e938c184a291bf053af3b14c1e3e8bb29aee57e2/openfold/utils/precision_utils.py#L14C1-L23C24
+    """
+    fp16_enabled = torch.get_autocast_gpu_dtype() == torch.float16
+    fp16_enabled = fp16_enabled and torch.is_autocast_enabled()
+    return fp16_enabled
+
 
 max_neg_value = lambda x: torch.finfo(x.dtype).min  # noqa
 
@@ -106,8 +134,19 @@ class AttentionPairBias(torch.nn.Module):
         attn_bias_mode: str = "none",
         dim_pair: int | None = None,
         use_qk_layernorm: bool = True,
+        use_flash_attn: bool = False,
+        flash_attn_dtype: str = "bf16",
     ):
         super().__init__()
+        if use_flash_attn:
+            assert dim_pair is None, "Cannot use flash attention with pair bias"
+            flash_attn_dtype_dict = {"fp16": torch.float16, "bf16": torch.bfloat16}
+            if flash_attn_dtype not in flash_attn_dtype_dict:
+                raise ValueError(
+                    f"Invalid option for flash_attn_dtype '{flash_attn_dtype}': must be one of {list(flash_attn_dtype_dict.keys())}."
+                )
+            self.flash_attn_dtype = flash_attn_dtype_dict[flash_attn_dtype]
+        self.use_flash_attn = use_flash_attn
         self.attn_bias_mode = attn_bias_mode
         inner_dim = dim_head * heads
         dim_out = dim_out if dim_out is not None else node_dim
@@ -172,41 +211,16 @@ class AttentionPairBias(torch.nn.Module):
         )  # [B, heads, N, N]
 
         q, k, v, g = map(lambda t: rearrange(t, "b ... (h d) -> b h ... d", h=h), (q, k, v, g))
-        attn_feats = self._attn(q, k, v, b, mask)
+
+        if self.use_flash_attn:
+            assert b == 0, "Cannot use flash attention with pair bias"
+            attn_feats = self._flash_attn(q, k, v, mask)
+        else:
+            attn_feats = self._attn(q, k, v, b, mask)
+
         attn_feats = rearrange(torch.sigmoid(g) * attn_feats, "b h n d -> b n (h d)", h=h)
 
         return self.to_out_node(attn_feats)
-
-    def scatter_values(self, values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-            values: Tensor of shape [B, H, N, k] - values to scatter.
-            indices: Tensor of shape [B, N, k] - target indices in last dim.
-
-        Returns
-        -------
-            out: Tensor of shape [B, H, N, N] with scattered values, zeros elsewhere.
-        """
-        B, H, N, k = values.shape
-
-        # if k > N, the indices and values are meaningful (non-zero) only up until N
-        # so slice into both up until N to avoid the case in which the indices are non-unique (and equal to zero),
-        # which may cause inconsistencies
-        values = values[:, :, :, : min(N, k)]
-        indices = indices[:, :, : min(N, k)]
-
-        # Initialize output tensor
-        out = torch.zeros(B, H, N, N, device=values.device, dtype=values.dtype)
-
-        # Expand indices to match values shape
-        # indices: [B, N, k] -> [B, 1, N, k] -> [B, H, N, k]
-        expanded_indices = indices.unsqueeze(1).expand(-1, H, -1, -1)
-
-        # Scatter along the last dimension (dim=3, which is N in [B, H, N, N])
-        out.scatter_(dim=3, index=expanded_indices.to(values.device), src=values)
-
-        return out
 
     def _attn(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, b: torch.Tensor | int, mask: torch.Tensor | None = None
@@ -239,6 +253,115 @@ class AttentionPairBias(torch.nn.Module):
             sim = sim.masked_fill(~mask, max_neg_value(sim))
         attn = torch.softmax(sim + b, dim=-1)
         return torch.einsum("b h i j, b h j d -> b h i d", attn, v)
+
+    def _flash_attn(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Adapted from https://github.com/flagshippioneering/flash_ipa.
+
+        Parameters
+        ----------
+            q : torch.Tensor
+                [B, H, N, Q], where Q is some feature dimension
+            k : torch.Tensor
+                [B, H, N, Q]
+            v : torch.Tensor
+                [B, H, N, V], where V is some feature dimension
+            mask : torch.Tensor | None, default=None
+                [B, N]
+
+        Returns
+        -------
+            attn_res : torch.Tensor
+            [B, H, N, V]
+        """
+        if mask is None:
+            mask = torch.ones((q.shape[0], q.shape[2]), device=q.device)
+
+        q, k, v = map(lambda t: rearrange(t, "b h n d -> b n h d"), (q, k, v))  # rearrange tokens and heads
+
+        qkv = torch.cat([q.unsqueeze(2), k.unsqueeze(2), v.unsqueeze(2)], dim=2)
+        (
+            qkv,
+            indices,
+            cu_seqlens,
+            max_seqlen,
+            _,
+        ) = self._preprocess_flashattn_input(qkv, mask)
+
+        if qkv.dtype != self.flash_attn_dtype:
+            qkv = qkv.to(self.flash_attn_dtype)
+
+        # importing here just so one doesn't have to have flash-attn installed if they don't want to use it
+        from flash_attn import flash_attn_varlen_qkvpacked_func  # type: ignore
+
+        attn_res = flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, softmax_scale=1)
+
+        attn_res = self._postprocess_flashattn_output(
+            attn_res,
+            indices=indices,
+            batch=q.shape[0],
+            seqlen=q.shape[1],
+        )
+
+        attn_res = attn_res.float()  # cast back to float32
+
+        attn_res = rearrange(attn_res, "b n h d -> b h n d")  # rearrange tokens and heads
+
+        return attn_res
+
+    def _preprocess_flashattn_input(
+        self, qkv: torch.Tensor, attention_mask: torch.Tensor, unused_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | float, torch.Tensor]:
+        """
+        Process attention inputs (qkv: queries, keys, and values) to be used by flash-attention 2.
+        Taken from https://github.com/flagshippioneering/flash_ipa.
+
+        Arguments:
+            qkv: (batch, seqlen, ...)
+            attention_mask: (batch, seqlen), bool / int, 1 means valid and 0 means not valid.
+            unused_mask: (batch, seqlen), bool / int, 1 means the element is allocated but unused.
+        Return:
+            qkv: (total_nnz, ...), where total_nnz = number of tokens selected in attention_mask + unused_mask.
+            indices: (total_nnz), the indices of masked tokens from the flattened input sequence.
+            cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
+            max_seqlen_in_batch: int
+            seqused: (batch), returns the number of tokens selected in attention_mask + unused_mask.
+        """
+        all_masks = (attention_mask + unused_mask) if unused_mask is not None else attention_mask
+        seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
+        used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+        indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
+        max_seqlen_in_batch = seqlens_in_batch.max().item()
+        cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+        return (
+            rearrange(qkv, "b s ... -> (b s) ...")[indices],
+            indices,
+            cu_seqlens,
+            max_seqlen_in_batch,
+            used_seqlens_in_batch,
+        )
+
+    def _postprocess_flashattn_output(
+        self, hidden_states: torch.Tensor, indices: torch.Tensor, batch: int, seqlen: int
+    ) -> torch.Tensor:
+        """
+        Process the output of flash-attention 2 to be a standard attention map.
+        Taken from https://github.com/flagshippioneering/flash_ipa.
+
+        Arguments:
+            attn_res: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
+            indices: (total_nnz), the indices that represent the non-masked tokens of the original padded input sequence.
+            batch: int, batch size for the padded sequence.
+            seqlen: int, maximum sequence length for the padded sequence.
+        Return:
+            attn_res: (batch, seqlen, ...)
+        """
+        dim = hidden_states.shape[1:]
+        output = torch.zeros((batch * seqlen), *dim, device=hidden_states.device, dtype=hidden_states.dtype)
+        output[indices] = hidden_states
+        return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 
 class AdaptiveScale(torch.nn.Module):
@@ -289,7 +412,7 @@ class AdaptiveBiasedMultiHeadAttention(torch.nn.Module):
     attn_bias_mode : str (optional)
         The representation type with which the self-attention operation is biased, can be "pair" or "none"
     dim_pair : int | None (optional)
-        Dimensionality of the pair_rep. If None, neither is used.
+        Dimensionality of the pair representation.
     use_qkv_bias : bool (optional)
         Whether to use bias in the linear projection to construct queries, keys and values for the self-attention operation.
     use_qk_layernorm : bool (optional)
@@ -306,6 +429,8 @@ class AdaptiveBiasedMultiHeadAttention(torch.nn.Module):
         dim_pair: int | None = None,
         use_qkv_bias: bool = True,
         use_qk_layernorm: bool = True,
+        use_flash_attn: bool = False,
+        flash_attn_dtype: str = "bf16",
     ):
         super().__init__()
 
@@ -323,6 +448,8 @@ class AdaptiveBiasedMultiHeadAttention(torch.nn.Module):
             attn_bias_mode=attn_bias_mode,
             dim_pair=dim_pair,
             use_qk_layernorm=use_qk_layernorm,
+            use_flash_attn=use_flash_attn,
+            flash_attn_dtype=flash_attn_dtype,
         )
         self.adaptive_scale = AdaptiveScale(dim=dim_seq, dim_cond=dim_cond)
 
@@ -353,7 +480,6 @@ class AdaptiveBiasedMultiHeadAttention(torch.nn.Module):
             )
 
         seq_rep = self.adaptive_layernorm(seq_rep, seq_cond, mask)
-
         seq_rep = self.attention(seq_rep, pair_feats=pair_rep, mask=mask)
 
         seq_rep = self.adaptive_scale(seq_rep, seq_cond)
@@ -371,9 +497,23 @@ class Transition(torch.nn.Module):
         expansion_factor: factor by which dim is multiplied to obtain hidden feature dimension
     """
 
-    def __init__(self, *, dim: int, expansion_factor: int = 2):
+    def __init__(
+        self,
+        *,
+        dim: int,
+        expansion_factor: int = 2,
+        use_pre_layer_norm: bool = False,
+        mask_input: bool = False,
+        mask_output: bool = False,
+    ):
         super().__init__()
         dim_inner = int(dim * expansion_factor)
+        self.use_pre_layer_norm = use_pre_layer_norm
+        self.mask_input = mask_input
+        self.mask_output = mask_output
+
+        if self.use_pre_layer_norm:
+            self.layer_norm = LayerNorm(dim)
 
         self.ff = torch.nn.Sequential(
             torch.nn.Linear(dim, dim_inner * 2, bias=False), SwiGLU(), torch.nn.Linear(dim_inner, dim, bias=False)
@@ -382,8 +522,20 @@ class Transition(torch.nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # [..., dim]
+        mask: torch.Tensor | None = None,  # [...] or [..., 1]
     ) -> torch.Tensor:  # [..., dim]
-        return self.ff(x)
+        if self.mask_input and mask is not None:
+            x = x * mask
+
+        if self.use_pre_layer_norm:
+            x = self.layer_norm(x)
+
+        x = self.ff(x)
+
+        if self.mask_output and mask is not None:
+            x = x * mask
+
+        return x
 
 
 class AdaptiveTransition(torch.nn.Module):
@@ -429,13 +581,17 @@ class AdaptiveAttentionTransitionBlock(torch.nn.Module):
     attn_bias_mode : str (optional)
         The representation type with which the self-attention operation is biased, can be "pair" or "none"
     dim_pair : int | None (optional)
-        Dimensionality of the pair_rep.
+        Dimensionality of the pair representation.
     expansion_factor : int (optional)
         Factor by which dim is multiplied to obtain hidden feature dimension within the AdptiveTransition
     use_qkv_bias : bool (optional)
         Whether to use bias in the linear projection to construct queries, keys and values for the self-attention operation.
     use_qk_layernorm : bool (optional)
         Whether to apply a layernorm to queries and keys in the self-attention operation.
+    use_flash_attn : bool (optional)
+        Whether to use flash-attention 2.
+    flash_attn_dtype : str (optional)
+        The data-type to use for flash-attention 2.
     """
 
     def __init__(
@@ -450,6 +606,8 @@ class AdaptiveAttentionTransitionBlock(torch.nn.Module):
         expansion_factor: int = 2,
         use_qkv_bias: bool = True,
         use_qk_layernorm: bool = True,
+        use_flash_attn: bool = False,
+        flash_attn_dtype: str = "bf16",
     ):
         super().__init__()
 
@@ -462,6 +620,8 @@ class AdaptiveAttentionTransitionBlock(torch.nn.Module):
             attn_bias_mode=attn_bias_mode,
             use_qkv_bias=use_qkv_bias,
             use_qk_layernorm=use_qk_layernorm,
+            use_flash_attn=use_flash_attn,
+            flash_attn_dtype=flash_attn_dtype,
         )
         self.adaptive_transition = AdaptiveTransition(
             dim=dim_single, dim_cond=dim_cond, expansion_factor=expansion_factor
@@ -553,11 +713,11 @@ class PairUpdate(torch.nn.Module):
         pair_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         pair_rep = pair_rep * pair_mask.unsqueeze(-1)
         if hasattr(self, "triangle_mult_out"):
-            pair_rep = pair_rep + self.triangle_mult_out(pair_rep, pair_mask)
+            pair_rep = pair_rep + checkpoint(self.triangle_mult_out, pair_rep, pair_mask)
             pair_rep = pair_rep * pair_mask.unsqueeze(-1)
-            pair_rep = pair_rep + self.triangle_mult_in(pair_rep, pair_mask)
+            pair_rep = pair_rep + checkpoint(self.triangle_mult_in, pair_rep, pair_mask)
             pair_rep = pair_rep * pair_mask.unsqueeze(-1)
-        pair_rep = pair_rep + self.pair_transition(pair_rep, pair_mask)
+        pair_rep = pair_rep + checkpoint(self.pair_transition, pair_rep, pair_mask)
         return pair_rep * pair_mask.unsqueeze(-1)
 
 
@@ -1002,7 +1162,19 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         b = b * self.sigmoid(self.linear_b_g(z))
         b = b * self.linear_b_p(z)
 
-        x = self._combine_projections(a, b)
+        # Prevents overflow of torch.matmul in combine projections in
+        # reduced-precision modes
+        a_std = a.std()
+        b_std = b.std()
+        if _is_fp16_enabled() and a_std != 0.0 and b_std != 0.0:
+            a = a / a.std()
+            b = b / b.std()
+
+        if _is_fp16_enabled():
+            with torch.cuda.amp.autocast(enabled=False):
+                x = self._combine_projections(a.float(), b.float())
+        else:
+            x = self._combine_projections(a, b)
 
         del a, b
         x = self.layer_norm_out(x)

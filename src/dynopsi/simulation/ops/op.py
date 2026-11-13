@@ -1,10 +1,9 @@
-from pydantic import BaseModel
-
 from dynopsi.model.model_config import DynoPsiModelConfig
 from dynopsi.simulation.store import Store
+from dynopsi.utils.strict_config import StrictConfig
 
 
-class Op(BaseModel):
+class Op(StrictConfig):
     """
     Abstract base for an operation in a simulation plan.
 
@@ -25,6 +24,7 @@ class Op(BaseModel):
     this is used for serialization/deserialization.
     """
 
+    name: str
     valid_steps: dict[str, list[int]]
 
     def input_state_keys(self, step_num: int) -> set[str]:
@@ -69,6 +69,33 @@ class Op(BaseModel):
         -------
         set[str]
             Store keys for state that this op writes at step_num. Empty by default.
+        """
+        return set()
+
+    def get_output_step(self, input_step_num: int) -> int | None:
+        """
+        Get the output step number given the input step number.
+
+        Arguments
+        ----------
+        input_step_num : int
+            The input step number to get the output step for.
+
+        Returns
+        -------
+        int | None
+            The output step number, or None if not active at that step.
+        """
+        return None
+
+    def intermediate_observable_keys(self) -> set[str]:
+        """
+        Intermediate state keys that this op writes, step agnostic. This is used for observation only.
+
+        Returns
+        -------
+        set[str]
+            Store keys for intermediate state(s) that this op writes to at any step num. Empty by default.
         """
         return set()
 

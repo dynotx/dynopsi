@@ -14,6 +14,7 @@ import einops
 import torch
 import torch.nn as nn
 
+from dynopsi.model.nn.layers import _is_fp16_enabled
 from dynopsi.model.nn.primitives import LayerNorm, Linear
 
 
@@ -65,8 +66,13 @@ class DistogramHead(OutputHead):
         return logits
 
     def forward(self, batch: dict[str, Any]) -> dict[str, Any]:
+        # Casting logic copied from OpenFold's DistogramHead
         pair_rep = batch["pair_rep"]
-        out = self._forward(pair_rep)
+        if _is_fp16_enabled():
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                out = self._forward(pair_rep.float())
+        else:
+            out = self._forward(pair_rep)
         return {"distogram_prediction": out}
 
 
@@ -126,9 +132,7 @@ class CoordsDecoderHead(SingleRepDecoderHead):
         out = super().forward(batch)
         out_coords = einops.rearrange(out["out_single_rep"], "b n (a e) -> b n a e", e=3)  # [*, N, num_atoms, 3]
 
-        output = {"out_coords": out_coords}
-
-        return output
+        return {"out_coords": out_coords}
 
 
 class DynoPsiOutputHead(OutputHead):

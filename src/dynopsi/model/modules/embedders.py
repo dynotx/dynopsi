@@ -27,6 +27,48 @@ from dynopsi.model.nn.featurization_layers import (
 from dynopsi.model.nn.layers import AdaptiveLayerNorm, Transition
 
 
+def _per_chain_centroid_shift(
+    coords: torch.Tensor,
+    chain_ids: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Per-residue chain centroid of unpadded atoms.
+
+    Parameters
+    ----------
+    coords : torch.Tensor, shape [batch, N, num_atoms, 3]
+    chain_ids : torch.Tensor, shape [batch, N]
+    mask : torch.Tensor or None, shape [batch, N]
+        Residue-level valid mask. Pad residues are excluded from the mean.
+
+    Returns
+    -------
+    torch.Tensor, shape [batch, N, 3]
+        Centroid of each residue's chain. Empty / all-pad chains are zero.
+    """
+    batch, n_tokens, n_atoms, _ = coords.shape
+    residue_valid = (
+        torch.ones((batch, n_tokens), dtype=torch.bool, device=coords.device) if mask is None else mask.bool()
+    )
+    atom_valid = residue_valid.unsqueeze(-1).expand(batch, n_tokens, n_atoms)
+    batch_ix = torch.arange(batch, device=coords.device).view(batch, 1, 1).expand(batch, n_tokens, n_atoms)
+    pair = torch.stack((batch_ix, chain_ids.long().unsqueeze(-1).expand(batch, n_tokens, n_atoms)), dim=-1).reshape(
+        -1, 2
+    )  # [batch * N * num_atoms, 2]
+    unique_pairs, inverse = torch.unique(pair, dim=0, return_inverse=True)
+    weights = atom_valid.reshape(-1).to(dtype=coords.dtype)
+    points = coords.reshape(-1, 3)
+    n_keys = unique_pairs.shape[0]
+    sums = points.new_zeros((n_keys, 3))  # [n_keys, 3]
+    counts = points.new_zeros((n_keys, 1))  # [n_keys, 1]
+    inverse_ex = inverse.unsqueeze(-1)
+    sums.scatter_add_(0, inverse_ex.expand(-1, 3), points * weights.unsqueeze(-1))
+    counts.scatter_add_(0, inverse_ex, weights.unsqueeze(-1))
+    centroids = torch.where(counts > 0, sums / counts.clamp_min(1.0), torch.zeros_like(sums))
+    # Atoms of one residue share a chain id, so atom 0 indexes that residue's centroid.
+    return centroids[inverse.reshape(batch, n_tokens, n_atoms)[:, :, 0]]  # [batch, N, 3]
+
+
 class DynoPsiSingleRepEncoder(nn.Module, FeatureEncoder):
     """Single representation encoder.
 
@@ -46,6 +88,9 @@ class DynoPsiSingleRepEncoder(nn.Module, FeatureEncoder):
         use_inpaint_dgram: bool
             Whether to use inpainting features in the single rep.
             Note: The name is a bit misleading (since there is no distogram in the single rep), but it has been kept for backwards compatibility.
+        center_single_rep_per_chain: bool
+            If True and ``chain_ids`` is provided, subtract each chain's unpadded
+            centroid from ``coords`` and ``sc_coords`` before ``bb_dense``.
     """
 
     def __init__(
@@ -55,12 +100,14 @@ class DynoPsiSingleRepEncoder(nn.Module, FeatureEncoder):
         num_atoms: int,
         index_embed_dim: int | None,
         use_inpaint_dgram: bool = False,
+        center_single_rep_per_chain: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.use_self_cond = use_self_cond
         self.index_embed_dim = index_embed_dim or embed_dim
         self.use_inpaint_dgram = use_inpaint_dgram
+        self.center_single_rep_per_chain = center_single_rep_per_chain
 
         assert embed_dim % num_atoms == 0, "embed_dim must be divisible by num_atoms"
 
@@ -87,6 +134,7 @@ class DynoPsiSingleRepEncoder(nn.Module, FeatureEncoder):
         sc_coords: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
         inpaint_features: torch.Tensor | None = None,
+        chain_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Parameters
@@ -101,12 +149,20 @@ class DynoPsiSingleRepEncoder(nn.Module, FeatureEncoder):
                 Mask for the backbone coordinates
             inpaint_features: torch.Tensor, shape [batch_size, N] (optional)
                 Inpainting features for the structure. If None, no inpainting features are used.
+            chain_ids: torch.Tensor, shape [batch_size, N] (optional)
+                Per-residue chain ids (``asym_id``). Centering runs when
+                ``center_single_rep_per_chain`` is on and this tensor is provided.
 
         Returns
         -------
             torch.Tensor, shape [batch_size, N, embed_dim]
                 Embedding of the protein
         """
+        if self.center_single_rep_per_chain and chain_ids is not None:
+            shift = _per_chain_centroid_shift(coords, chain_ids, mask)
+            coords = coords - shift.unsqueeze(-2)
+            if sc_coords is not None:
+                sc_coords = sc_coords - shift.unsqueeze(-2)
         coords_emb = self.bb_dense(coords)  # [batch_size, N, num_atoms, embed_dim // num_atoms]
         coords_emb = coords_emb.flatten(start_dim=-2)  # [batch_size, N, embed_dim]
         if (self.use_inpaint_dgram) and (inpaint_features is None):
@@ -378,8 +434,8 @@ class DynoPsiPairRepEncoder(nn.Module, FeatureEncoder):
         # Convert inpaint_feature to masks
         inpaint_masks = torch.stack(
             [
-                (inpaint_features == constants.InpaintFeature.BINDER_CONTEXT),
-                (inpaint_features == constants.InpaintFeature.TARGET_CONTEXT),
+                (inpaint_features == constants.InpaintFeature.BINDER_CONTEXT.value),
+                (inpaint_features == constants.InpaintFeature.TARGET_CONTEXT.value),
             ],
             dim=1,
         )  # [batch_size, 2, seq_len]
@@ -464,6 +520,17 @@ class DynoPsiSingleConditionalEmbedder(nn.Module):
     use_inpaint_dgram: bool
         Whether to use inpainting features in the single rep (and inpainting distogram in the pair rep if present).
         Note: The name is a bit misleading (since there is no distogram in the single rep), but it has been kept for backwards compatibility.
+    use_pre_cond_feature_mlp1_layer_norm: bool
+        Whether to apply a layer norm before the first conditional feature MLP transition block.
+    use_pre_cond_feature_mlp2_layer_norm: bool
+        Whether to apply a layer norm before the second conditional feature MLP transition block.
+    mask_conditional_mlp_input: bool
+        Whether to zero-out padding positions in the conditional features before the initial dense projection.
+    mask_conditional_mlp_output: bool
+        Whether to zero-out padding positions in the conditional features after the initial dense projection.
+    center_single_rep_per_chain: bool
+        If True and chain ids are provided, subtract each chain's unpadded
+        centroid from ``coords`` and ``sc_coords`` before ``bb_dense``.
     """
 
     def __init__(
@@ -479,6 +546,11 @@ class DynoPsiSingleConditionalEmbedder(nn.Module):
         index_embed_dim: int | None,
         num_time_embeddings: int,
         use_inpaint_dgram: bool = False,
+        use_pre_cond_feature_mlp1_layer_norm: bool = False,
+        use_pre_cond_feature_mlp2_layer_norm: bool = False,
+        mask_conditional_mlp_input: bool = False,
+        mask_conditional_mlp_output: bool = False,
+        center_single_rep_per_chain: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -487,6 +559,10 @@ class DynoPsiSingleConditionalEmbedder(nn.Module):
         self.cond_embed_dim = cond_embed_dim or embed_dim
         self.index_embed_dim = index_embed_dim or embed_dim
         self.use_inpaint_dgram = use_inpaint_dgram
+        self.use_pre_cond_feature_mlp1_layer_norm = use_pre_cond_feature_mlp1_layer_norm
+        self.use_pre_cond_feature_mlp2_layer_norm = use_pre_cond_feature_mlp2_layer_norm
+        self.mask_conditional_mlp_input = mask_conditional_mlp_input
+        self.mask_conditional_mlp_output = mask_conditional_mlp_output
 
         self.single_rep_encoder = DynoPsiSingleRepEncoder(
             self.embed_dim,
@@ -494,6 +570,7 @@ class DynoPsiSingleConditionalEmbedder(nn.Module):
             num_atoms=num_atoms,
             index_embed_dim=index_embed_dim,
             use_inpaint_dgram=use_inpaint_dgram,
+            center_single_rep_per_chain=center_single_rep_per_chain,
         )
 
         self.chain_break_encoder = ChainBreakEncoder()
@@ -510,12 +587,24 @@ class DynoPsiSingleConditionalEmbedder(nn.Module):
         self.conditional_feature_dense = nn.Linear(
             self.conditional_feature_generator.get_output_dim(), self.cond_embed_dim, bias=False
         )
-        self.conditional_feature_mlp_1 = Transition(dim=self.cond_embed_dim, expansion_factor=2)
-        self.conditional_feature_mlp_2 = Transition(dim=self.cond_embed_dim, expansion_factor=2)
+        self.conditional_feature_mlp_1 = Transition(
+            dim=self.cond_embed_dim,
+            expansion_factor=2,
+            use_pre_layer_norm=use_pre_cond_feature_mlp1_layer_norm,
+            mask_input=mask_conditional_mlp_input,
+            mask_output=mask_conditional_mlp_output,
+        )
+        self.conditional_feature_mlp_2 = Transition(
+            dim=self.cond_embed_dim,
+            expansion_factor=2,
+            use_pre_layer_norm=use_pre_cond_feature_mlp2_layer_norm,
+            mask_input=mask_conditional_mlp_input,
+            mask_output=mask_conditional_mlp_output,
+        )
 
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         coords = batch["coords"]
-        indices = batch["indices"]
+        indices = batch["token_index"]
         t = batch["t"]
         sc_coords = batch.get("sc_coords", None)
         chain_ids = batch.get("asym_id", None)
@@ -528,19 +617,34 @@ class DynoPsiSingleConditionalEmbedder(nn.Module):
         residue_indices = batch["residue_index"]
         batch["polymer_breaks"] = self.polymer_break_encoder(residue_indices, mask)
 
-        single_rep = self.single_rep_encoder(coords, indices, sc_coords, mask=mask, inpaint_features=inpaint_features)
-
-        conditional_feats_embedding = self.conditional_feature_generator(
-            batch, t, indices.shape[1], t_ss=t_ss, mask=mask
-        )
-        conditional_feats_embedding = self.conditional_feature_dense(conditional_feats_embedding)
-        conditional_feats_embedding = self.conditional_feature_mlp_2(
-            self.conditional_feature_mlp_1(conditional_feats_embedding)
+        single_rep = self.single_rep_encoder(
+            coords,
+            indices,
+            sc_coords,
+            mask=mask,
+            inpaint_features=inpaint_features,
+            chain_ids=chain_ids,
         )
 
         if mask is None:
             mask = torch.ones(single_rep.shape[:-1], device=single_rep.device).long()  # [batch_size, seq_len]
         single_mask = mask.unsqueeze(-1)  # [batch_size, seq_len, 1]
+
+        conditional_feats_embedding = self.conditional_feature_generator(
+            batch, t, indices.shape[1], t_ss=t_ss, mask=mask
+        )
+
+        if self.mask_conditional_mlp_input:
+            conditional_feature_dense_input = conditional_feats_embedding * single_mask
+        else:
+            conditional_feature_dense_input = conditional_feats_embedding
+        conditional_feats_embedding = self.conditional_feature_dense(conditional_feature_dense_input)
+        if self.mask_conditional_mlp_output:
+            conditional_feats_embedding = conditional_feats_embedding * single_mask
+
+        conditional_feats_embedding = self.conditional_feature_mlp_2(
+            self.conditional_feature_mlp_1(conditional_feats_embedding, mask=single_mask), mask=single_mask
+        )
 
         return {
             "single_rep": single_rep * single_mask,
@@ -606,7 +710,7 @@ class DynoPsiSingleConditionalPairEmbedder(DynoPsiSingleConditionalEmbedder):
 
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         coords = batch["coords"]
-        indices = batch["indices"]
+        indices = batch["token_index"]
         t = batch["t"]
         sc_coords = batch.get("sc_coords", None)
         true_coords = batch.get("true_coords", None)

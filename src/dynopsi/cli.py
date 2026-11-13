@@ -7,16 +7,17 @@ from typing import Literal
 
 from dynopsi.design_pipeline import DesignPipeline
 from dynopsi.design_pipeline_parser import DesignLanguageParser
+from dynopsi.model.model_config import DynoPsiModelConfig
 
 logger = logging.getLogger(__name__)
 
 
-def _load_design_pipelines(config_path: str) -> list[DesignPipeline]:
+def _load_design_pipelines(config_path: str, checkpoint: str | None = None) -> list[DesignPipeline]:
     """Load design pipelines from a YAML config file."""
     if not (config_path.endswith(".yaml") or config_path.endswith(".yml")):
         raise ValueError(f"Unsupported config format: {config_path}. Use a .yaml or .yml file.")
     parser = DesignLanguageParser()
-    return parser.parse(config_path)
+    return parser.parse(config_path, checkpoint=checkpoint)
 
 
 def _cmd_sample(
@@ -24,6 +25,7 @@ def _cmd_sample(
     num_samples: int,
     batch_size: int | None,
     overwrite: bool,
+    checkpoint: str | None = None,
 ) -> None:
     """Load a config and generate samples.
 
@@ -33,19 +35,16 @@ def _cmd_sample(
     num_samples : int, the number of samples to generate per featurization specification.
     batch_size : int, batch size for inference. If None, it will be inferred by the available CUDA-enabled GPUs.
     overwrite : bool, whether to check if the output directory for a `design_pipeline` already exists. If True, entire folder for the design pipeline will be removed and rewritten.
+    checkpoint : str | None, checkpoint short name; None uses the config or the default.
 
     Raises
     ------
     FileExistsError if the output directory for a `design_pipeline` already exists and `overwrite = False`.
     """
-    design_pipelines = _load_design_pipelines(config_path)
+    design_pipelines = _load_design_pipelines(config_path, checkpoint=checkpoint)
 
     for design_pipeline in design_pipelines:
-        save_dir = os.path.join(
-            design_pipeline.output_specification.output_dir,
-            design_pipeline.name,
-            design_pipeline.simulation_pipeline.name,
-        )
+        save_dir = design_pipeline.simulation_output_dir()
         if os.path.exists(save_dir):
             if not overwrite:
                 raise FileExistsError(
@@ -59,6 +58,7 @@ def _cmd_check(
     config_path: str,
     output_format: Literal["pdb", "mmcif"],
     overwrite: bool,
+    checkpoint: str | None = None,
 ) -> None:
     """Load config and run design_pipeline.verify_configuration(). Output dir is from the config YAML.
 
@@ -67,19 +67,21 @@ def _cmd_check(
     config_path : str, path to the configuration file specifying the design pipelines.
     output_format : Literal["pdb", "mmcif"], output format for the featurization preview (CLI "cif" is converted to mmcif before calling).
     overwrite : bool, whether to check if the output directory for a `design_pipeline` already exists. If True, entire folder for the `design_pipeline` featurization preview will be removed and rewritten.
+    checkpoint : str | None, checkpoint short name; None uses the config or the default.
 
     Raises
     ------
     FileExistsError if the output directory for a `design_pipeline` already exists and `overwrite = False`.
+    ConditioningCheckpointError if a pipeline's registered conditioning keys disagree with its checkpoint.
     """
-    design_pipelines = _load_design_pipelines(config_path)
+    with DynoPsiModelConfig.prior_free():
+        design_pipelines = _load_design_pipelines(config_path, checkpoint=checkpoint)
 
     for design_pipeline in design_pipelines:
-        verify_outdir = os.path.join(
-            design_pipeline.output_specification.output_dir,
-            design_pipeline.name,
-            "verify_configuration",
-        )
+        design_pipeline.assert_conditioning_matches_checkpoint()
+
+    for design_pipeline in design_pipelines:
+        verify_outdir = design_pipeline.verification_output_dir()
         if os.path.exists(verify_outdir):
             if not overwrite:
                 raise FileExistsError(
@@ -101,7 +103,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="dynopsi",
-        description="Ψ Dyno Psi-1: Sampling pipelines for de novo miniprotein binder design.",
+        description="Ψ Psi: Sampling pipelines for de novo miniprotein binder design (default model: Cicada).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True, help="Command to run")
@@ -130,6 +132,15 @@ def main() -> None:
         action="store_true",
         help="Allow overwriting existing output directory",
     )
+    sample_parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Published checkpoint short name (default: v1.5-cicada; available: v1.5-cicada, v1). "
+            "Must match the config's checkpoint: if both are set."
+        ),
+    )
 
     # Check command parsing
     check_parser = subparsers.add_parser(
@@ -153,6 +164,15 @@ def main() -> None:
         action="store_true",
         help="Allow overwriting existing output directory",
     )
+    check_parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Published checkpoint short name (default: v1.5-cicada; available: v1.5-cicada, v1). "
+            "Must match the config's checkpoint: if both are set."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -162,6 +182,7 @@ def main() -> None:
             num_samples=args.num_samples,
             batch_size=args.batch_size,
             overwrite=args.overwrite,
+            checkpoint=args.checkpoint,
         )
     elif args.command == "check":
         # CLI exposes pdb/cif; convert cif -> mmcif so internally we only see pdb or mmcif
@@ -170,6 +191,7 @@ def main() -> None:
             config_path=args.config,
             output_format=output_format,
             overwrite=args.overwrite,
+            checkpoint=args.checkpoint,
         )
     else:
         parser.print_help()

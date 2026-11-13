@@ -22,6 +22,7 @@ class HotspotFeaturizer(Featurizer):
       Positions of hotspot residues.
       These will be assigned PocketFeature.POCKET in the output features.
        See `data.constants.PocketFeature` for details on the encoding.
+       If None, then all residues will be assigned PocketFeature.UNSPECIFIED.
     index_type : Literal["original_residue_index", "auth_residue_index"]
       Which index type to use for specifying hotspot positions, either
       the original 1-index residue indices (`original_residue_index`) or
@@ -30,7 +31,7 @@ class HotspotFeaturizer(Featurizer):
     """
 
     type: Literal["hotspot"] = "hotspot"
-    hotspot_positions: ChainResidueRepr
+    hotspot_positions: ChainResidueRepr | None
     index_type: Literal["original_residue_index", "auth_residue_index"] = "original_residue_index"
 
     @field_validator("hotspot_positions", mode="before")
@@ -39,25 +40,6 @@ class HotspotFeaturizer(Featurizer):
         if isinstance(v, str):
             return ChainResidueRepr.from_string(v)
         return v
-
-    @property
-    def asym_id_to_index_map(self) -> dict[int, torch.Tensor | None]:
-        """Map from asym ID to residue indices in the crop, using the specified index type.
-
-        Returns
-        -------
-        dict[int, torch.Tensor | None]
-          Keys are asym IDs; values are 1D tensors of residue indices, or None for whole chain.
-
-        See Also
-        --------
-        ChainResidueRepr.get_aym_id_to_index_map : Builds the underlying asym ID to index list mapping.
-        """
-        result = {
-            k: torch.tensor(v) if v is not None else None
-            for k, v in self.hotspot_positions.get_asym_id_to_index_map(self.index_type).items()
-        }
-        return result
 
     def __call__(self, inputs: Iterable[Features]) -> Iterator[Features]:
         """Add hotspot information to each input feature.
@@ -91,12 +73,13 @@ class HotspotFeaturizer(Featurizer):
         """
         for input_features in inputs:
             new_feats = input_features.safe_copy()
+            if "pocket_feature" in new_feats.keys():
+                raise ValueError("pocket_feature is already present in the features")
+
             # potentially add original_residue_index to the features
             if "original_residue_index" not in new_feats.keys():
                 new_feats["original_residue_index"] = new_feats["residue_index"].clone()
 
-            # check that auth_residue_index is present in the features
-            # if it is used to specify the hotspot positions
             if self.index_type == "auth_residue_index":
                 asym_id_type = "auth_asym_id"
                 if "auth_residue_index" not in new_feats.keys():
@@ -104,27 +87,29 @@ class HotspotFeaturizer(Featurizer):
             else:
                 asym_id_type = "asym_id"
 
-            # use hotspot_mask to determine POCKET
-            hotspot_mask = self.hotspot_positions.to_mask(
-                asym_id=new_feats[asym_id_type],
-                residue_index=new_feats[self.index_type],
-                pad_mask=new_feats["token_pad_mask"],
-                index_type=self.index_type,
-            )
-            # check that the hotspot_mask doesn't intersect with binder_mask
-            if (hotspot_mask & new_feats["binder_mask"]).any():
-                raise ValueError("The hotspot mask intersects with the binder mask")
+            if self.hotspot_positions is not None:
+                hotspot_mask = self.hotspot_positions.to_mask(
+                    asym_id=new_feats[asym_id_type],
+                    residue_index=new_feats[self.index_type],
+                    pad_mask=new_feats["token_pad_mask"],
+                    index_type=self.index_type,
+                    auth_chain_id_table=new_feats.resolved_auth_chain_id_table(),
+                )
+                if (hotspot_mask & new_feats["binder_mask"]).any():
+                    raise ValueError("The hotspot mask intersects with the binder mask")
 
-            # build the pocket_feature tensor
-            # 1. initialize pocket_feature to UNSPECIFIED
-            pocket_feature = torch.zeros_like(new_feats["token_index"]) + PocketFeature.UNSPECIFIED
+                # build the pocket_feature tensor
+                # 1. initialize pocket_feature to UNSPECIFIED
+                pocket_feature = torch.zeros_like(new_feats["token_index"]) + PocketFeature.UNSPECIFIED
 
-            # 2. use binder_mask and target_mask to determine BINDER and UNSELECTED, respectively
-            pocket_feature[new_feats["binder_mask"]] = PocketFeature.BINDER
-            pocket_feature[new_feats["target_mask"]] = PocketFeature.UNSELECTED
+                # 2. use binder_mask and target_mask to determine BINDER and UNSELECTED, respectively
+                pocket_feature[new_feats["binder_mask"]] = PocketFeature.BINDER
+                pocket_feature[new_feats["target_mask"]] = PocketFeature.UNSELECTED
 
-            # 3. set the pocket feature to POCKET for the hotspot positions
-            pocket_feature[hotspot_mask] = PocketFeature.POCKET
+                # 3. set the pocket feature to POCKET for the hotspot positions
+                pocket_feature[hotspot_mask] = PocketFeature.POCKET
+            else:
+                pocket_feature = torch.zeros_like(new_feats["token_index"]) + PocketFeature.UNSPECIFIED
 
             # update the features w/ pocket_feature
             new_feats["pocket_feature"] = pocket_feature

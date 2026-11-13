@@ -1,16 +1,20 @@
 import logging
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import torch
 from pydantic import PrivateAttr, field_validator, model_validator
-from typing_extensions import Self
 
+from dynopsi.data.auth_chain_identity import (
+    auth_chain_id_table_from_chains,
+    merge_auth_chain_id_tables,
+    resolve_unique_letter_auth_int,
+)
 from dynopsi.data.constants import AtomFilter, DesignDesignation
-from dynopsi.data.featurization import Features, Featurizer
+from dynopsi.data.featurization.base import Features, Featurizer
 from dynopsi.data.featurization.registry import register_featurizer
-from dynopsi.data.featurization.utils import concat_features, crop_features
+from dynopsi.data.featurization.utils import concat_features_with_auth_tables, crop_features
 from dynopsi.data.structure import Structure
 from dynopsi.data.structure_io import (
     load_structure_from_afdb,
@@ -142,14 +146,13 @@ class ReferenceStructureFeaturizer(Featurizer):
                 elif self.afdb_uniprot_id is not None:
                     structure = load_structure_from_afdb(self.afdb_uniprot_id)
                 elif self.structure_path is not None:
-                    if self.structure_path.lower().endswith(".pdb"):
+                    suffix = Path(self.structure_path).suffix.lower()
+                    if suffix == ".pdb":
                         structure = load_structure_from_pdb(self.structure_path)
-                    elif self.structure_path.lower().endswith(".cif") or self.structure_path.lower().endswith(".mmcif"):
+                    elif suffix == ".cif" or suffix == ".mmcif":
                         structure = load_structure_from_cif(self.structure_path)
                     else:
                         raise ValueError(f"Invalid file extension: {self.structure_path}. Must be .pdb or .cif/.mmcif")
-                else:
-                    raise ValueError("Either rcsb_record_id or afdb_uniprot_id must be provided")
                 self._structure = structure
             else:
                 structure = self._structure
@@ -181,7 +184,13 @@ class ReferenceStructureFeaturizer(Featurizer):
                 chains_specified = [
                     chain_id for chain_ids in self.design_designation.values() for chain_id in chain_ids
                 ]
-                asym_ids_specified = [get_asym_id_from_chain_id(chain_id) for chain_id in chains_specified]
+                auth_table = auth_chain_id_table_from_chains(structure.chains) if structure is not None else {}
+                if self.index_type == "auth_residue_index":
+                    asym_ids_specified = [
+                        resolve_unique_letter_auth_int(chain_id, auth_table) for chain_id in chains_specified
+                    ]
+                else:
+                    asym_ids_specified = [get_asym_id_from_chain_id(chain_id) for chain_id in chains_specified]
                 if set(structure_asym_ids) != set(asym_ids_specified):
                     if set(asym_ids_specified) - set(structure_asym_ids) != set():
                         raise ValueError(
@@ -204,10 +213,14 @@ class ReferenceStructureFeaturizer(Featurizer):
                         target_mask = torch.full((n_tokens,), False, dtype=torch.bool)
 
                 for design_designation, chain_ids in self.design_designation.items():
+                    if self.index_type == "auth_residue_index":
+                        chain_ints = [resolve_unique_letter_auth_int(chain_id, auth_table) for chain_id in chain_ids]
+                    else:
+                        chain_ints = [get_asym_id_from_chain_id(chain_id) for chain_id in chain_ids]
                     mask = (
                         torch.isin(
                             self._reference_structure_feature_dict_cache[asym_id_col],
-                            torch.tensor([get_asym_id_from_chain_id(chain_id) for chain_id in chain_ids]),
+                            torch.tensor(chain_ints),
                         )
                         & self._reference_structure_feature_dict_cache["token_pad_mask"].bool()
                     )
@@ -256,15 +269,24 @@ class ReferenceStructureFeaturizer(Featurizer):
         )
         for input_features in inputs:
             new_feats = input_features.safe_copy()
+            structure_auth_table = (
+                auth_chain_id_table_from_chains(self._structure.chains) if self._structure is not None else {}
+            )
             if len(new_feats.keys()) == 0:
                 new_feats.feature_dict = {k: v.clone() for k, v in reference_structure_features.items()}
                 ref_asym_id_map = None
                 ref_auth_asym_id_map = None
+                new_feats.auth_chain_id_table = merge_auth_chain_id_tables(
+                    [new_feats.auth_chain_id_table, structure_auth_table]
+                )
+
             else:
-                new_feats.feature_dict = concat_features(
+                new_feats.feature_dict, new_feats.auth_chain_id_table = concat_features_with_auth_tables(
                     [new_feats.feature_dict, reference_structure_features],
+                    [new_feats.auth_chain_id_table, structure_auth_table],
                     make_asym_ids_unique=True,
                     make_entity_ids_unique=True,
+                    reset_residue_index=False,
                 )
                 # check if there was a change in asym_id and add this to the metadata
                 # in the format {original_asym_id: new_asym_id}
@@ -274,7 +296,7 @@ class ReferenceStructureFeaturizer(Featurizer):
                 new_asym_ids = new_feats["asym_id"][n_nonpad_tokens_input:]
                 new_auth_asym_ids = new_feats["auth_asym_id"][n_nonpad_tokens_input:]
                 ref_asym_id_map = {
-                    ref_asym_id: expected_ref_asym_id
+                    int(ref_asym_id): int(expected_ref_asym_id)
                     for ref_asym_id, expected_ref_asym_id in zip(ref_asym_ids.numpy(), new_asym_ids.numpy())
                 }
                 ref_auth_asym_id_map = {
@@ -302,7 +324,9 @@ class ReferenceStructureFeaturizer(Featurizer):
                     )
                 else:
                     structure = self._structure
-                structure = new_feats.input_reference_structure.concat(structure)
+                structure = new_feats.input_reference_structure.merge(
+                    structure, mode="concatenate", reset_residue_index=False
+                )
                 new_feats.input_reference_structure = structure
 
             yield new_feats

@@ -8,12 +8,20 @@ from dynopsi.data.featurization.primitives.hotspot import HotspotFeaturizer
 from dynopsi.data.featurization.primitives.inpainting import InpaintFeaturizer
 from dynopsi.data.featurization.primitives.new_chains import (
     BinderRgCenterOfMassEstimator,
+    FixedHotspotOffsetEstimator,
     NewChainsCentersOfMassFunctionType,
     NewChainsFeaturizer,
     PredefinedCenterOfMassEstimator,
+    SphereExclusionCenterEstimator,
 )
 from dynopsi.data.featurization.primitives.noise_mask import NoiseMaskFeaturizer
 from dynopsi.data.featurization.primitives.reference_structure import ReferenceStructureFeaturizer
+from dynopsi.data.featurization.primitives.structure_conditioning import (
+    ChainIsLoopyConditioningFeaturizer,
+    ConstantWriteConditioningFeaturizer,
+    SecondaryStructureConditioningFeaturizer,
+    make_constant_write,
+)
 
 __all__ = [
     "ReferenceStructureFeaturizer",
@@ -27,5 +35,11 @@ __all__ = [
     "PriorMeansConfig",
     "BinderRgCenterOfMassEstimator",
     "PredefinedCenterOfMassEstimator",
+    "FixedHotspotOffsetEstimator",
+    "SphereExclusionCenterEstimator",
     "NewChainsCentersOfMassFunctionType",
+    "ChainIsLoopyConditioningFeaturizer",
+    "ConstantWriteConditioningFeaturizer",
+    "SecondaryStructureConditioningFeaturizer",
+    "make_constant_write",
 ]

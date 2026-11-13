@@ -44,25 +44,6 @@ class CropFeaturizer(Featurizer):
             return ChainResidueRepr.from_string(v)
         return v
 
-    @property
-    def asym_id_to_index_map(self) -> dict[int, torch.Tensor | None]:
-        """Map from asym ID to residue indices in the crop, using the specified index type.
-
-        Returns
-        -------
-        dict[int, torch.Tensor | None]
-            Keys are asym IDs; values are 1D tensors of residue indices, or None for "whole chain".
-
-        See Also
-        --------
-        ChainResidueRepr.get_asym_id_to_index_map : Builds the underlying asym ID to index list mapping.
-        """
-        result = {
-            k: torch.tensor(v) if v is not None else None
-            for k, v in self.residue_index_chain_spec.get_asym_id_to_index_map(self.index_type).items()
-        }
-        return result
-
     def __call__(self, inputs: Iterable[Features]) -> Iterator[Features]:
         """Crop each feature to the specified subset of residues.
 
@@ -116,6 +97,7 @@ class CropFeaturizer(Featurizer):
                 residue_index=new_feats[self.index_type],
                 pad_mask=new_feats["token_pad_mask"],
                 index_type=self.index_type,
+                auth_chain_id_table=new_feats.resolved_auth_chain_id_table(),
             )
             token_mask = torch.zeros_like(new_feats["token_index"], dtype=torch.bool)
             token_mask[crop_mask] = True
@@ -133,7 +115,9 @@ class CropFeaturizer(Featurizer):
 
             if new_feats.input_reference_structure is not None:
                 structure = new_feats.input_reference_structure.crop(
-                    residue_index_chain_spec=self.residue_index_chain_spec, index_type=index_type
+                    residue_index_chain_spec=self.residue_index_chain_spec,
+                    index_type=index_type,
+                    reset_residue_index=True,
                 )
                 new_feats.input_reference_structure = structure
                 if self.verbose_metadata:

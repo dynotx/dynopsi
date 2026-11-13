@@ -1,10 +1,12 @@
 from typing import Annotated, Literal
 
 import torch
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from dynopsi.utils.strict_config import StrictConfig
 
 
-class SingleParameterFunction(BaseModel):
+class SingleParameterFunction(StrictConfig):
     """
     Abstract base class for functions with a single parameter.
     Pydantic BaseModel enables serialization and deserialization of the function.
@@ -62,9 +64,43 @@ class InverseParameterFunction(SingleParameterFunction):
             return res
 
 
+class PiecewisePowerFunction(SingleParameterFunction):
+    """Ramp from 0 to max_value and back to 0 with independently controllable steepness on both sides of the ramp."""
+
+    type: Literal["piecewise_power"] = "piecewise_power"
+    y_max_value: float
+    t_mode: float
+    t_mode_radius: float = 0.05
+    t_left_zero: float = 0.0
+    t_right_zero: float = 1.0
+    left_steepness: float = 1.0
+    right_steepness: float = 1.0
+
+    def __call__(self, parameter: torch.Tensor) -> torch.Tensor:
+        p = parameter
+        t_lz, t_rz = self.t_left_zero, self.t_right_zero
+        t_ml = self.t_mode - self.t_mode_radius
+        t_mr = self.t_mode + self.t_mode_radius
+
+        left_ramp = self.y_max_value * ((p - t_lz) / (t_ml - t_lz)) ** self.left_steepness
+        right_ramp = self.y_max_value * ((t_rz - p) / (t_rz - t_mr)) ** self.right_steepness
+
+        in_domain = (p > t_lz) & (p < t_rz)
+        left_mask = in_domain & (p < t_ml)
+        right_mask = in_domain & (p > t_mr)
+        plateau_mask = in_domain & (p >= t_ml) & (p <= t_mr)
+
+        out = torch.zeros_like(p)
+        out = torch.where(left_mask, left_ramp, out)
+        out = torch.where(right_mask, right_ramp, out)
+        out = torch.where(plateau_mask, torch.full_like(p, self.y_max_value), out)
+        return out
+
+
 # Discriminative union for SingleParameterFunction
 # Allows for automatic serialization/deserialization of the function.
 # See https://docs.pydantic.dev/latest/usage/types/#discriminated-unions.
 SingleParameterFunctionType = Annotated[
-    ConstantFunction | PowerLawFunction | InverseParameterFunction, Field(discriminator="type")
+    ConstantFunction | PowerLawFunction | InverseParameterFunction | PiecewisePowerFunction,
+    Field(discriminator="type"),
 ]

@@ -1,26 +1,28 @@
 import logging
+import threading
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired, Self, TypedDict
 
 import numpy as np
 import torch
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-from typing_extensions import NotRequired, Self, TypedDict
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from dynopsi.data.featurization import Features
-from dynopsi.data.featurization.utils import crop_features
-from dynopsi.data.structure import MultiModelStructure, Structure
+from dynopsi.data.constants import InpaintFeature
+from dynopsi.data.featurization.base import Features
+from dynopsi.data.featurization.sample_centers import reference_features_for_sample
+from dynopsi.data.structure import MultiModelStructure
 from dynopsi.data.structure_io import save_structures_to_file
-from dynopsi.data.utils import align_by_mask
+from dynopsi.utils.strict_config import StrictConfig
 
 logger = logging.getLogger(__name__)
 
 OutputTimestep = Literal["any", "final"]
 OutputFormat = Literal["pdb", "mmcif", "npz"]
+PrimaryResidueIndexKey = Literal["res_idx", "auth_res_idx"]
 
 
-class ObservableOutputConfig(BaseModel):
+class ObservableOutputConfig(StrictConfig):
     """Define the output configuration for an observable state key.
 
     During pipeline setup, an ObservableOutputConfig is created for each state key
@@ -29,22 +31,34 @@ class ObservableOutputConfig(BaseModel):
     Attributes
     ----------
     state_type : Literal["clean_data_coords", "conditional_vector_fields"]
-        The type of state key to output.
+        The type of state to output.
         The type determines the valid output formats.
     outputs : dict[Timestep, tuple[OutputFormat, ...]]
         The output formats and timesteps to record an observable.
         The OutputFormat is restricted by the state key type.
         Only coordinates can be output in pdb and mmcif formats.
         All other state keys can only be output in npz format.
-    features_key : str or None, optional
-        The key of the features to use for the observable. If None, this this field must
-        be set by the simulation pipeline before use.
+    features_keys : list[str]
+        The keys of the features sets to use when saving this observable. Each key
+        produces its own set of output files. If empty, this field must be populated
+        via ``add_features_key`` by the simulation pipeline before use. When more than
+        one key is present, each key is appended to the output filename to disambiguate.
+    primary_residue_index_key : Literal["res_idx", "auth_res_idx"]
+        Which residue numbers to write in designed PDB/mmCIF
+        files. ``res_idx`` is sequential 0-based ``residue_index`` (the default).
+        ``auth_res_idx`` writes ``auth_residue_index`` as seqid.
+    save_raw_context_output : bool
+        Save model-generated coordinates for context replaced by the reference structure.
+        When that context was noised, each requested pdb, mmcif, or npz output also
+        writes those coordinates to a ``rawcontext_`` file.
     """
 
-    state_type: Literal["clean_data_coords", "conditional_vector_fields"]
+    state_type: Literal["clean_data_coords", "conditional_vector_fields", "step_updates", "any"]
     outputs: dict[OutputTimestep, tuple[OutputFormat, ...]]
 
-    features_key: str | None = None
+    features_keys: list[str] = Field(default_factory=list)
+    primary_residue_index_key: PrimaryResidueIndexKey = "res_idx"
+    save_raw_context_output: bool = False
 
     @model_validator(mode="after")
     def _check_output_formats(self) -> Self:
@@ -54,15 +68,10 @@ class ObservableOutputConfig(BaseModel):
                     raise ValueError(f"Only npz format is supported for state keys of type: {self.state_type}")
         return self
 
-    def set_features_key(self, new_key: str) -> None:
-        if self.features_key is None:
-            self.features_key = new_key
-        else:
-            if self.features_key != new_key:
-                raise ValueError(
-                    f"Trying to set `features_key` in ObservableOutputConfig, but there is a mismatch. "
-                    f"Current value: {self.features_key}, new value {new_key}"
-                )
+    def add_features_key(self, key: str) -> None:
+        """Add a features key if not already present."""
+        if key not in self.features_keys:
+            self.features_keys.append(key)
 
 
 class FileOutputConfig(TypedDict):
@@ -101,6 +110,8 @@ class Observable(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    _record_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+
     total_batch_size: int | None = None
     observable_output_configs: dict[str, ObservableOutputConfig] = Field(default_factory=dict)
     observable_outputs: dict[str, dict[int, dict[str, torch.Tensor]]] = Field(default_factory=dict)
@@ -134,6 +145,7 @@ class Observable(BaseModel):
         (total_batch_size, *value.shape[1:]) per modality. Then copies
         value into [batch_slice]. If total_batch_size was None, it is set
         from batch_slice (batch_slice.stop) or value.shape[0].
+        Concurrent callers share one buffer: allocate-and-write holds one lock.
 
         Parameters
         ----------
@@ -149,28 +161,33 @@ class Observable(BaseModel):
         if batch_slice is None:
             batch_slice = slice(0, next(iter(value.values())).shape[0])
 
-        # First record for this trajectory sets total batch size (e.g. from chunked run).
-        if self.total_batch_size is None:
-            self.total_batch_size = batch_slice.stop
-        n = self.total_batch_size
+        with self._record_lock:
+            # First record for this trajectory sets total batch size (e.g. from chunked run).
+            if self.total_batch_size is None:
+                self.total_batch_size = batch_slice.stop
+            n = self.total_batch_size
 
-        if key not in self.observable_outputs:
-            self.observable_outputs[key] = {}
-        steps = self.observable_outputs[key]
-        if step_num not in steps:
-            steps[step_num] = {}
-            # Allocate full-batch buffers per modality for this step.
+            if key not in self.observable_outputs:
+                self.observable_outputs[key] = {}
+            steps = self.observable_outputs[key]
+            if step_num not in steps:
+                steps[step_num] = {}
+                # Allocate full-batch buffers per modality for this step.
+                for modality, tensor in value.items():
+                    device = tensor.device
+                    dtype = tensor.dtype
+                    shape = (n,) + tensor.shape[1:]
+                    buf = torch.zeros(shape, device=device, dtype=dtype)
+                    steps[step_num][modality] = buf
+
+            # Write incoming chunk (or full batch) into the correct batch indices.
             for modality, tensor in value.items():
-                device = tensor.device
-                dtype = tensor.dtype
-                shape = (n,) + tensor.shape[1:]
-                buf = torch.zeros(shape, device=device, dtype=dtype)
-                steps[step_num][modality] = buf
-
-        # Write incoming chunk (or full batch) into the correct batch indices.
-        for modality, tensor in value.items():
-            buf = steps[step_num][modality]
-            steps[step_num][modality][batch_slice] = tensor.detach().clone().to(buf.device)
+                buf = steps[step_num][modality]
+                if tensor.shape[0] == n:
+                    value_slice = batch_slice
+                else:
+                    value_slice = slice(batch_slice.start, batch_slice.start + tensor.shape[0])
+                steps[step_num][modality][value_slice] = tensor.detach().clone().to(buf.device)
 
     def get_observable(self, key: str) -> dict[int, dict[str, torch.Tensor]] | None:
         """Get the observable output for a key in the format of dict[step_num, dict[modality, tensor]]."""
@@ -199,32 +216,35 @@ class Observable(BaseModel):
         all_output_files: list[FileOutputConfig] = []
 
         # save the observable
-        self.save_observable_to_npz(save_dir=save_dir, start_index=start_index)
+        npz_output_files = self.save_observable_to_npz(save_dir=save_dir, start_index=start_index)
+        all_output_files.extend(npz_output_files)
 
         # save clean data coords as other file formats
         for state_key, config in self.observable_output_configs.items():
-            for timesteps, output_formats in config.outputs.items():
-                # this is checked earlier, but just in case throw an error
-                if config.features_key is None:
-                    raise ValueError(
-                        f"features_key definition in observable_output_configs is required, "
-                        f"but is missing for {state_key}, timestep {timesteps}, state type {config.state_type}"
-                    )
-                else:
-                    features_key = config.features_key
-                if config.state_type == "clean_data_coords":
-                    output_files_by_timestep: list[FileOutputConfig] = self.save_clean_data_coords(
-                        save_dir=save_dir,
-                        timesteps=timesteps,
-                        output_formats=output_formats,
-                        observable_key=state_key,
-                        reference_features_key=features_key,
-                        reference_features=reference_features[features_key],
-                        start_index=start_index,
-                    )
-                    all_output_files.extend(output_files_by_timestep)
-                else:
-                    continue
+            if not config.features_keys:
+                raise ValueError(
+                    f"features_keys in observable_output_configs is empty for {state_key}. "
+                    f"The simulation pipeline must call add_features_key before saving."
+                )
+            disambiguate = len(config.features_keys) > 1
+            for features_key in config.features_keys:
+                for timesteps, output_formats in config.outputs.items():
+                    if config.state_type == "clean_data_coords":
+                        output_files_by_timestep: list[FileOutputConfig] = self.save_clean_data_coords(
+                            save_dir=save_dir,
+                            timesteps=timesteps,
+                            output_formats=output_formats,
+                            observable_key=state_key,
+                            reference_features_key=features_key,
+                            reference_features=reference_features[features_key],
+                            start_index=start_index,
+                            features_label=features_key if disambiguate else None,
+                            primary_residue_index_key=config.primary_residue_index_key,
+                            save_raw_context_output=config.save_raw_context_output,
+                        )
+                        all_output_files.extend(output_files_by_timestep)
+                    else:
+                        continue
         return all_output_files
 
     def save_observable_to_npz(
@@ -275,22 +295,22 @@ class Observable(BaseModel):
         reference_features_key: str,
         reference_features: Features,
         start_index: int,
+        features_label: str | None = None,
+        primary_residue_index_key: PrimaryResidueIndexKey = "res_idx",
+        save_raw_context_output: bool = False,
     ) -> list[FileOutputConfig]:
         """Save predicted final structure coordinates with relevant features in the specified formats.
 
         Notes
         -----
         Coordinates for each timestep are aligned to the unnoised positions, if possible.
-        Otherwise, coordinates for each intermediate step are aligned to the coordinates at the final timestep..
+        Otherwise, coordinates for each intermediate step are aligned to the coordinates at the final timestep.
         """
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         observable = self.get_observable(observable_key)
         if observable is None:
             return []
-
-        reference_feature_dict = {k: v.clone() for k, v in reference_features.feature_dict.items()}
-        features_metadata = reference_features.get_metadata(verbose=False)
 
         if timesteps == "final":
             step = max(observable.keys())
@@ -313,89 +333,66 @@ class Observable(BaseModel):
             # Reshape to (batch_size, num_timesteps, num_atoms, 3)
             coords_stack = coords_stack.reshape(batch_size, num_timesteps, -1, 3)
 
-        # Strip padding
-        atom_pad_mask = torch.zeros(coords_stack.shape[2], dtype=torch.bool, device=coords_stack.device)
-        atom_pad_mask[torch.where(reference_feature_dict["atom_pad_mask"].bool())[0]] = True
-        coords_stack = coords_stack[:, :, atom_pad_mask, :]
-
         # Output is a dictionary of output files for each output format
         output_files: list[FileOutputConfig] = []
 
-        # Construct reference coords if available
-        non_noised_atom_mask = reference_feature_dict["atom_to_token"][:, ~reference_feature_dict["noised_mask"]].any(
-            dim=1
+        features_metadata = reference_features.get_metadata(verbose=False)
+        raw_structure_output_requested = save_raw_context_output and any(
+            output_format in output_formats for output_format in ("pdb", "mmcif", "npz")
         )
-        ref_mask = reference_feature_dict["atom_resolved_mask"].bool() & non_noised_atom_mask
-        if ref_mask.any():
-            use_input_features_alignment = True
-        else:
-            use_input_features_alignment = False
 
         for batch_idx in range(coords_stack.shape[0]):
-            structures: list[Structure] = []
             coords = coords_stack[batch_idx]  # (num_timesteps, n_atoms, 3)
-            num_timesteps = coords.shape[0]
 
-            if use_input_features_alignment:
-                reference_coords = reference_feature_dict["coords"][0]  # (n_atoms, 3)
-                reference_mask = ref_mask  # n_atoms
-            else:
-                # Align to the final state
-                reference_coords = coords[-1]  # (n_atoms, 3)
-                reference_mask = reference_feature_dict["atom_resolved_mask"].bool()  # n_atoms
-
-            # The structure for each timestep is a different model in the output file
-            for t in range(num_timesteps):
-                coords_t = align_by_mask(coords[t], reference_coords, reference_mask, reference_mask)
-                reference_feature_dict["coords"] = coords_t.unsqueeze(0)
-
-                if features_metadata["reference_structure_input"] is None:
-                    structure = Features(
-                        feature_dict=reference_feature_dict, atoms_to_include=reference_features.atoms_to_include
-                    ).to_structure()
-                else:
-                    # Only retain the denoised positions
-                    cropped_ref_feat = crop_features(
-                        reference_feature_dict, token_mask=reference_feature_dict["noised_mask"].clone()
-                    )
-                    structure = Features(
-                        feature_dict=cropped_ref_feat, atoms_to_include=reference_features.atoms_to_include
-                    ).to_structure()
-
-                    # Add the reference structure to the denoised structure
-                    # This step adds side chains to the reference structure
-                    # The noised coordinates are already aligned to the reference features
-                    structure = structure.concat(features_metadata["reference_structure_input"])
-
-                structures.append(structure)
+            sample_features = reference_features_for_sample(reference_features, start_index + batch_idx)
+            structures = sample_features.design_coordinates_to_structure(coords, use_reference_for_noised_context=True)
+            raw_structures = (
+                sample_features.design_coordinates_to_structure(coords, use_reference_for_noised_context=False)
+                if raw_structure_output_requested and _has_noised_reference_context(sample_features)
+                else None
+            )
 
             state_name = "final_state" if timesteps == "final" else "trajectory"
-            sample_name = f"{observable_key}_{state_name}_{start_index + batch_idx}"
+            name_parts = [observable_key]
+            if features_label is not None:
+                name_parts.append(features_label)
+            name_parts.append(f"{state_name}_{start_index + batch_idx}")
+            sample_name = "_".join(name_parts)
 
             if "npz" in output_formats:
-                npz_file = save_dir / f"{sample_name}.npz"
-                if len(structures) == 1:
-                    structures[0].dump_to_npz(npz_file)
-                else:
-                    multi_model_structure = MultiModelStructure.from_structures(structures)
-                    multi_model_structure.dump_to_npz(npz_file)
-                output_files.append(
-                    FileOutputConfig(
-                        state_key=observable_key,
-                        features_key=reference_features_key,
-                        timestep=timesteps,
-                        output_format="npz",
-                        path=npz_file,
-                        metadata=features_metadata,
+                npz_outputs = [(structures, save_dir / f"{sample_name}.npz")]
+                if raw_structures is not None:
+                    npz_outputs.append((raw_structures, save_dir / f"rawcontext_{sample_name}.npz"))
+                for structures_to_save, npz_file in npz_outputs:
+                    sequential_structures = [
+                        structure.with_sequential_auth_res_idx() for structure in structures_to_save
+                    ]
+                    if len(sequential_structures) == 1:
+                        sequential_structures[0].dump_to_npz(npz_file)
+                    else:
+                        multi_model_structure = MultiModelStructure.from_structures(sequential_structures)
+                        multi_model_structure.dump_to_npz(npz_file)
+                    output_files.append(
+                        FileOutputConfig(
+                            state_key=observable_key,
+                            features_key=reference_features_key,
+                            timestep=timesteps,
+                            output_format="npz",
+                            path=npz_file,
+                            metadata=features_metadata,
+                        )
                     )
-                )
 
             output_formats_to_check: list[OutputFormat] = ["pdb", "mmcif"]
             for output_format in output_formats_to_check:
                 if output_format in output_formats:
                     file_extension = "pdb" if output_format == "pdb" else "cif"
                     file_name = save_dir / f"{sample_name}.{file_extension}"
-                    save_structures_to_file(structures, file_name)
+                    logger.info(
+                        "Writing designed structure residue seqids from %s.",
+                        primary_residue_index_key,
+                    )
+                    save_structures_to_file(structures, file_name, primary_residue_index_key=primary_residue_index_key)
                     output_files.append(
                         FileOutputConfig(
                             state_key=observable_key,
@@ -406,5 +403,33 @@ class Observable(BaseModel):
                             metadata=features_metadata,
                         )
                     )
+                    if raw_structures is not None:
+                        raw_file_name = save_dir / f"rawcontext_{sample_name}.{file_extension}"
+                        save_structures_to_file(
+                            raw_structures,
+                            raw_file_name,
+                            primary_residue_index_key=primary_residue_index_key,
+                        )
+                        output_files.append(
+                            FileOutputConfig(
+                                state_key=observable_key,
+                                features_key=reference_features_key,
+                                timestep=timesteps,
+                                output_format=output_format,
+                                path=raw_file_name,
+                                metadata=features_metadata,
+                            )
+                        )
 
         return output_files
+
+
+def _has_noised_reference_context(features: Features) -> bool:
+    if features.input_reference_structure is None:
+        return False
+
+    inpaint_feature = features.feature_dict["inpaint_feature"]
+    context_mask = (
+        (inpaint_feature == InpaintFeature.BINDER_CONTEXT) | (inpaint_feature == InpaintFeature.TARGET_CONTEXT)
+    ) & features.feature_dict["token_pad_mask"].bool()
+    return bool((context_mask & features.feature_dict["noised_mask"].bool()).any().item())

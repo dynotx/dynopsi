@@ -2,7 +2,7 @@ from typing import Any
 
 import torch
 
-from dynopsi.flow_matching.flow_matcher import FlowMatcher
+from dynopsi.flow_matching.flow_matcher import FlowMatcher, FlowMatcherOutput
 
 
 class ProteinModuleFlowMatcher(FlowMatcher):
@@ -12,7 +12,7 @@ class ProteinModuleFlowMatcher(FlowMatcher):
         super().__init__(*args, **kwargs)
 
         for modality in self.modalities:
-            if modality not in ["coords"]:  # Other modalities supported in future releases
+            if modality not in ["coords"]:
                 raise ValueError(f"Unsupported modality: {modality}")
 
         # The primary modality is defined as the one that handles coordinates, which is mandatory.
@@ -57,6 +57,7 @@ class ProteinModuleFlowMatcher(FlowMatcher):
         raw_predictions: dict[str, torch.Tensor],
         current_states: dict[str, torch.Tensor],
         times: dict[str, torch.Tensor],
+        postprocess_args: dict[str, Any] = {},
     ) -> dict[str, torch.Tensor | None]:
         """Convert the raw predictions to self-conditioning inputs.
 
@@ -66,7 +67,7 @@ class ProteinModuleFlowMatcher(FlowMatcher):
         for k in raw_predictions:
             if isinstance(raw_predictions[k], torch.Tensor):
                 raw_predictions[k] = raw_predictions[k].detach()
-        processed_predictions, _ = self._postprocess_predictions(raw_predictions)
+        processed_predictions, _ = self._postprocess_predictions(raw_predictions, **postprocess_args)
         sc_preds: dict[str, torch.Tensor | None] = {}
         for modality in self.modalities:
             if self.is_cvf_prediction[modality]:
@@ -76,16 +77,27 @@ class ProteinModuleFlowMatcher(FlowMatcher):
             else:
                 clean_data_preds = processed_predictions[f"out_{modality}"]
 
-            if modality == self.modality:  # add num_atoms dimension
-                bs, L, d = clean_data_preds.shape
-                num_atoms = int(d // 3)
-                clean_data_preds = clean_data_preds.reshape(bs, L, num_atoms, 3)
-
-            sc_preds[modality] = clean_data_preds
+            sc_preds[modality] = self._to_sc_coords_layout(modality, clean_data_preds)
         return sc_preds
 
+    def sc_inputs_from_flow_output(
+        self, flow_predictions: dict[str, FlowMatcherOutput]
+    ) -> dict[str, torch.Tensor | None]:
+        """Reshape clean x1 from ``(bs, L, d)`` to the denoiser's ``sc_coords`` layout."""
+        return {
+            modality: self._to_sc_coords_layout(modality, output.clean_data_point.detach())
+            for modality, output in flow_predictions.items()
+        }
+
+    def _to_sc_coords_layout(self, modality: str, clean: torch.Tensor) -> torch.Tensor:
+        """Reshape clean x1 ``(bs, L, d)`` to ``sc_coords`` ``(bs, L, n_atoms, 3)`` for coords."""
+        if modality != self.modality:
+            return clean
+        bs, length, d = clean.shape
+        return clean.reshape(bs, length, int(d // 3), 3)
+
     def _postprocess_predictions(
-        self, raw_predictions: dict[str, torch.Tensor]
+        self, raw_predictions: dict[str, torch.Tensor], **kwargs: Any
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """Postprocess the predictions from the denoising model to the format expected by the flow matching model,
         which is a dictionary of {out_{modality} : torch.Tensor} for each modality.

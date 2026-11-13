@@ -8,28 +8,39 @@ name = "dynopsi"
 version = "1.0.0"
 description = "dynopsi inference model for protein binder design"
 readme = "README.md"
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.12,<3.13"
 authors = [{ name = "DynoTx Open Source", email = "opensource@dynotx.com" }]
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE/**"]
 dependencies = [
     "einops>=0.8.0,<0.9",
     "gemmi==0.7.5",
     "pdbeccdutils==1.0.3",
     "huggingface-hub>=0.20.0",
+    "numpy",
     "pydantic>=2.0",
+    "pyyaml",
     "rdkit==2025.9.1",
     "scipy",
+    "requests>=2.31",
     "smart-open",
-    "torch>=2.6.0",
+    "torch>=2.6.0,<2.8",
+    "tqdm>=4.0",
 ]
 
 [project.scripts]
 dynopsi = "dynopsi.cli:main"
 
+[project.urls]
+Source = "https://github.com/dynotx/dynopsi"
+Changelog = "https://github.com/dynotx/dynopsi/blob/main/CHANGELOG.md"
+Migration = "https://github.com/dynotx/dynopsi/blob/main/MIGRATION.md"
+
 
 [dependency-groups]
 dev = [
     "mypy>=1.18.2",
+    "packaging",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
     "pytest-xdist>=3.8.0",
@@ -76,7 +87,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120
-target-version = 'py310'
+target-version = 'py312'
 
 [tool.ruff.lint]
 select = [
