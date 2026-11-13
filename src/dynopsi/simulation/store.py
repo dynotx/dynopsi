@@ -1,7 +1,8 @@
 import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from dynopsi.data.featurization import Features
+from dynopsi.data.featurization.base import Features
+from dynopsi.data.featurization.sample_centers import move_features_to_device
 from dynopsi.simulation.observable import Observable
 from dynopsi.simulation.time_sampler import TimeSchedule
 
@@ -26,9 +27,18 @@ class Store(BaseModel):
     batch_slice : slice or None
         Slice along the batch dimension that corresponds to the position in the observable
         that this store writes to. Used with observable.record(). If the observable is None, this is ignored.
+        Indices are chunk-local (start at 0 for each disk-write chunk), not global sample indices.
+    sample_offset : int
+        Global sample index of observable slot 0 in this disk-write chunk.
+        Prior seeds use ``sample_offset + batch_slice.start``.
     states : dict[str, dict[int, dict[str, torch.Tensor]]]
         State at each step: states[store_key][step_num][modality] -> tensor.
         Not a constructor argument; set by store.put() in Simulation.run()
+    previous_sc : dict[str, dict[str, torch.Tensor | None]]
+        Clean-x1 self-conditioning for the next Infer step, keyed by Infer op name.
+        Not a state key: ``clear_states`` drops the producing step, and the next
+        Infer step still reads this tensor. ``previous_step`` Infer ops in one
+        plan must not share a name.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -37,8 +47,10 @@ class Store(BaseModel):
     time_schedule: TimeSchedule
     observable: Observable | None = Field(default=None)
     batch_slice: slice | None = None
+    sample_offset: int = 0
 
     states: dict[str, dict[int, dict[str, torch.Tensor]]] = Field(default_factory=dict, init=False)
+    previous_sc: dict[str, dict[str, torch.Tensor | None]] = Field(default_factory=dict, init=False)
 
     @model_validator(mode="after")
     def _validate_store_keys(self) -> "Store":
@@ -56,8 +68,8 @@ class Store(BaseModel):
     @field_validator("time_schedule", mode="after")
     @classmethod
     def _validate_time_schedule(cls, time_schedule: TimeSchedule) -> TimeSchedule:
-        times, dts = time_schedule
         # check for correct formatting, tensors should be size [1 or bs, T, 1, 1]
+        times, dts = time_schedule
         error_msg = f"Incorrect size for {0} {1}, must be (bs or 1, T, 1, 1)"
         for mod, time in times.items():
             if len(time.shape) != 4 or time.shape[2] != 1 or time.shape[3] != 1:
@@ -66,6 +78,12 @@ class Store(BaseModel):
             if len(dt.shape) != 4 or dt.shape[2] != 1 or dt.shape[3] != 1:
                 raise ValueError(error_msg.format(mod, "dts"))
         return time_schedule
+
+    def prior_sample_index(self) -> int:
+        """Global index of the first sample in this store's batch."""
+        if self.batch_slice is None:
+            raise ValueError("prior_sample_index requires store.batch_slice")
+        return self.sample_offset + self.batch_slice.start
 
     def get_time(self, step_num: int, modality: str, batch_size: int) -> torch.Tensor:
         """Return a view of the time schedule."""
@@ -174,9 +192,10 @@ class Store(BaseModel):
         if self.observable is None:
             return
 
-        # check if in observable already
-        key_observable = self.observable.get_observable_step(key, step_num)
-        if key_observable is not None:
+        # Skip a second copy of any-timestep keys; final-only keys must still
+        # fill later batches in this save chunk after the first allocated the buffer.
+        already = self.observable.get_observable_step(key, step_num)
+        if already is not None and key in self.observable.keys_to_record_any_timestep:
             return
 
         # otherwise obtain from states
@@ -213,23 +232,22 @@ class Store(BaseModel):
         for key, steps in self.states.items():
             for step_data in steps.values():
                 for v in step_data.values():
-                    if v.dim() > 1:
-                        return v.shape[1]
-                    if v.dim() == 1:
-                        return v.shape[0]
+                    return v.shape[0]
         raise ValueError("Cannot infer batch size: no feature or state tensors with leading dim.")
 
     def to_device(self, device: torch.device) -> None:
-        """Move all tensors to the given device, except for the observable."""
-        for key, feat in self.features.items():
-            feat.feature_dict = {k: v.to(device) for k, v in feat.feature_dict.items()}
-        for key, steps in self.states.items():
+        """Move all tensors to the given device; the observable is not moved."""
+        for feat in self.features.values():
+            move_features_to_device(feat, device)
+        for steps in self.states.values():
             for step, step_data in steps.items():
-                step_data = {modality: value.to(device) for modality, value in step_data.items()}
+                steps[step] = {modality: value.to(device) for modality, value in step_data.items()}
 
     def clear_states(self, keep_step_num: int) -> None:
         """
         Clear all states except for the given step number.
+
+        ``previous_sc`` is left in place.
 
         Parameters
         ----------
@@ -246,3 +264,5 @@ class Store(BaseModel):
                 kept = self.states[key][keep_step_num]
                 del self.states[key]
                 self.states[key] = {keep_step_num: kept}
+            else:
+                del self.states[key]

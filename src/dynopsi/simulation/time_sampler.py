@@ -9,11 +9,12 @@ Modifications to the La Proteina-derived code were made by Dyno Therapeutics, In
 """
 
 from collections.abc import Iterator
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 import torch
-from pydantic import BaseModel, Field, field_validator, model_validator
-from typing_extensions import Self
+from pydantic import Field, field_validator, model_validator
+
+from dynopsi.utils.strict_config import StrictConfig
 
 TimeStepResult = tuple[float, float] | tuple[torch.Tensor, torch.Tensor]
 
@@ -22,7 +23,7 @@ TimestepsByModality = dict[str, torch.Tensor]  # shape (1, num_steps, 1, 1) or (
 TimeSchedule = tuple[TimesByModality, TimestepsByModality]
 
 
-class TimeSampler(BaseModel):
+class TimeSampler(StrictConfig):
     """
     Base class for time samplers, provides the sequence of steps and the full schedule for all modalities.
     Subclasses must implement get_steps() and get_full_schedule().
@@ -79,6 +80,10 @@ class LinearTimeSampler(TimeSampler):
             raise ValueError("Start time must be less than end time.")
         if len(self.modalities) == 0:
             raise ValueError("modalities must be non-empty.")
+        if self.end_time > 1.0:
+            raise ValueError("end_time must be <= 1.0.")
+        if self.start_time < 0.0:
+            raise ValueError("start_time must be >= 0.0.")
         return self
 
     def get_steps(self) -> range:
@@ -122,7 +127,7 @@ class LogTimeSampler(TimeSampler):
     @classmethod
     def check_num_steps(cls, num_steps: int) -> int:
         if num_steps < 1:
-            raise ValueError(f"num_steps needs to be > 1 but is {num_steps}")
+            raise ValueError(f"num_steps needs to be >= 1 but is {num_steps}")
         return num_steps
 
     def get_steps(self) -> range:
@@ -138,7 +143,43 @@ class LogTimeSampler(TimeSampler):
         step_sizes = timesteps[1:] - timesteps[:-1]
 
         # reshapae
-        timesteps = timesteps.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        timesteps = timesteps[:-1].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        step_sizes = step_sizes.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+
+        ts: TimesByModality = {modality: timesteps.clone() for modality in self.modalities}
+        dts: TimestepsByModality = {modality: step_sizes.clone() for modality in self.modalities}
+
+        return ts, dts
+
+
+class QuadraticTimeSampler(TimeSampler):
+    """Steps follow: f(x) = (x / num_steps) ** 2 for x in [0, num_steps].
+
+    Timesteps are spaced quadratically, concentrating more steps near t=0.
+    """
+
+    type: Literal["quadratic_time_sampler"] = "quadratic_time_sampler"
+    num_steps: int
+    modalities: tuple[str, ...] = ("coords",)
+
+    @field_validator("num_steps", mode="after")
+    @classmethod
+    def check_num_steps(cls, num_steps: int) -> int:
+        if num_steps < 1:
+            raise ValueError(f"num_steps needs to be >= 1 but is {num_steps}")
+        return num_steps
+
+    def get_steps(self) -> range:
+        """Return the sequence of step indices."""
+        return range(self.num_steps)
+
+    def get_full_schedule(self, device: torch.device) -> TimeSchedule:
+        """Return a TimeSchedule with all timesteps and dt, shapes (1, num_steps, 1, 1) for each modality."""
+        timesteps = torch.linspace(0.0, 1.0, self.num_steps + 1, device=device) ** 2
+
+        step_sizes = timesteps[1:] - timesteps[:-1]
+
+        timesteps = timesteps[:-1].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
         step_sizes = step_sizes.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
         ts: TimesByModality = {modality: timesteps.clone() for modality in self.modalities}
@@ -149,4 +190,4 @@ class LogTimeSampler(TimeSampler):
 
 # Discriminative union for TimeSampler
 # Allows for automatic serialization/deserialization of different time samplers classes.
-TimeSamplerType = Annotated[LinearTimeSampler | LogTimeSampler, Field(discriminator="type")]
+TimeSamplerType = Annotated[LinearTimeSampler | LogTimeSampler | QuadraticTimeSampler, Field(discriminator="type")]

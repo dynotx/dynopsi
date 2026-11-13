@@ -1,15 +1,17 @@
 from collections.abc import Callable
-from typing import Any, get_args, get_type_hints
+from typing import Any, TypeVar, get_args, get_type_hints
 
 from dynopsi.simulation.ops.op import Op
 
 OPS_REGISTRY: dict[str, type[Op]] = {}
 
+_OpT = TypeVar("_OpT", bound=Op)
 
-def register_op(overwrite: bool = False) -> Callable[[type[Op]], type[Op]]:
+
+def register_op(overwrite: bool = False) -> Callable[[type[_OpT]], type[_OpT]]:
     """Register a featurizer class with the registry."""
 
-    def register_decorator(op: type[Op]) -> type[Op]:
+    def register_decorator(op: type[_OpT]) -> type[_OpT]:
         # obtain the type of the featurizer
         type_hints = get_type_hints(op)
         type_literal = get_args(type_hints["type"])

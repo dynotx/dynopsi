@@ -3,17 +3,22 @@ from abc import abstractmethod
 from typing import Annotated, Literal
 
 import torch
-from pydantic import BaseModel, Field
+from pydantic import Field
 
-from dynopsi.data.constants import AtomFilter, PocketFeature
+from dynopsi.data.constants import AtomFilter
+from dynopsi.data.featurization.sample_centers import (
+    apply_random_global_translation,
+    expand_features_to_batch,
+)
 from dynopsi.data.utils import reshape_coords_for_model
 from dynopsi.model.model_config import DynoPsiModelConfig
 from dynopsi.simulation.store import Store
+from dynopsi.utils.strict_config import StrictConfig
 
 logger = logging.getLogger(__name__)
 
 
-class InitializeStep(BaseModel):
+class InitializeStep(StrictConfig):
     """Base class for an inference initialization step.
 
     Initialization steps take only features from the store as input and not
@@ -39,7 +44,25 @@ class InitializeStep(BaseModel):
     def output_feature_keys(self) -> set[str]:
         return set()
 
+    def input_state_keys(self) -> set[str]:
+        return set()
+
     def output_state_keys(self, step_num: int) -> set[str]:
+        return set()
+
+    def intermediate_observable_keys(self) -> set[str]:
+        """
+        Intermediate state keys that this op writes, step agnostic.
+
+        This method provides a way to output a standard intermediate keys for
+        observation and debugging without prior knowledge of the intermediate state keys,
+        and makes it so that the user doesn't have to list all these keys in the observable output config.
+
+        Returns
+        -------
+        set[str]
+            Store keys for intermediate state(s) written by this step. Empty by default.
+        """
         return set()
 
     @abstractmethod
@@ -80,16 +103,13 @@ class InitializeFeatures(InitializeStep):
         features = store.get_features(self.in_feat_loc_store).safe_copy()
 
         # expand to batch size
-        batch_size = store.batch_slice.stop - store.batch_slice.start
-        for key, value in features.feature_dict.items():
-            if isinstance(value, torch.Tensor):
-                features.feature_dict[key] = torch.stack([value] * batch_size)
+        batch_slice = store.batch_slice
+        if batch_slice is None:
+            raise ValueError("InitializeFeatures requires store.batch_slice")
+        batch_size = batch_slice.stop - batch_slice.start
+        features = expand_features_to_batch(features, batch_size)
 
-        # model needs some specific keys that renamed from features
-        features.feature_dict["resolved_mask"] = features.feature_dict["frame_resolved_mask"]
-        features.feature_dict.pop("frame_resolved_mask")
-        features.feature_dict["indices"] = features.feature_dict["token_index"]
-        features.feature_dict.pop("token_index")
+        apply_random_global_translation(features)
 
         assert isinstance(features.atoms_to_include, AtomFilter), (
             "Features must have atoms_to_include set as an AtomFilter."
@@ -103,47 +123,6 @@ class InitializeFeatures(InitializeStep):
         features.feature_dict["true_coords"] = reshaped_backbone_coords.reshape(
             batch_size, seq_len, -1, 3
         )  # shape: (batch_size, seq_len, 3, 3)
-
-        store.put_features(self.out_feat_loc_store, features)
-
-
-class InitializeUnconditionalPocketFeatures(InitializeStep):
-    """Initialize the features for the simulation for unconditional pocket sampling.
-
-    Specifically, this step reads the features from the store,
-    sets the hotspots to unselected in the target, and writes the updated features to a new store key.
-
-    Attributes
-    ----------
-    name : str
-        Name of the operation.
-    in_feat_loc_store : str
-        Store key for input features.
-    out_feat_loc_store : str
-        Store key for output features, with the pocket set to unselected.
-    """
-
-    type: Literal["initialize_unconditional_pocket_features"] = "initialize_unconditional_pocket_features"
-
-    name: str
-    in_feat_loc_store: str
-    out_feat_loc_store: str
-
-    def input_feature_keys(self) -> set[str]:
-        return {self.in_feat_loc_store}
-
-    def output_feature_keys(self) -> set[str]:
-        return {self.out_feat_loc_store}
-
-    def run(self, store: Store) -> None:
-        # get the features
-        features = store.get_features(self.in_feat_loc_store).safe_copy()
-
-        # set hotspots to unspecified for all residues
-        pocket_feature = features.feature_dict["pocket_feature"]
-        n_hotspots = (pocket_feature == PocketFeature.POCKET).sum().item()
-        features.feature_dict["pocket_feature"] = torch.full_like(pocket_feature, PocketFeature.UNSPECIFIED)
-        logger.info(f"Removing {n_hotspots} hotspot residues in unconditional features.")
 
         store.put_features(self.out_feat_loc_store, features)
 
@@ -173,6 +152,7 @@ class InitializeState(InitializeStep):
     inference_model_config: DynoPsiModelConfig
     in_feat_loc_store: str
     out_loc_store: str
+    seed: int | None = None
 
     def model_configs(self) -> list[DynoPsiModelConfig]:
         return [self.inference_model_config]
@@ -180,15 +160,16 @@ class InitializeState(InitializeStep):
     def input_feature_keys(self) -> set[str]:
         return {self.in_feat_loc_store}
 
+    def output_state_keys(self, step_num: int) -> set[str]:
+        if step_num == 0:
+            return {self.out_loc_store}
+        return set()
+
     def run(self, store: Store) -> None:
         """Run the steps to initialize the first state for the simulation.
 
         Steps:
-        1. Feature pre-processing:
-            - Pad the features to the max_tokens required by the flow model.
-            - Expand the features to the batch size (all elements of the batch will have the same immutable features).
-            - Process the features as specified by the model.
-            - Put the processed features in the store (in-place)
+        1. Retrieve the features from the store.
         2. Prior sampling:
             - Sample priors using the prior Sampler defined by the flow model
         3. Initial state computation:
@@ -212,6 +193,18 @@ class InitializeState(InitializeStep):
             features.feature_dict["coords"], features.feature_dict["frames_idx"], features.atoms_to_include
         )
 
+        generator = None
+        if self.seed is not None:
+            sample_index = store.prior_sample_index()
+            generator = torch.Generator(device=unmasked_data_coords.device)
+            generator.manual_seed(self.seed + sample_index)
+            logger.debug(
+                "sampling prior with seed=%s sample_index=%s batch_size=%s",
+                self.seed + sample_index,
+                sample_index,
+                batch_size,
+            )
+
         # only the coordinate modality is supported currently
         prior_sample = (
             priors["coords"]
@@ -220,6 +213,7 @@ class InitializeState(InitializeStep):
                 prior_mean=prior_mean_coords,
                 unmasked=unmasked_data_coords,
                 mask=features.feature_dict["noised_mask"].unsqueeze(-1),
+                generator=generator,
             )
             .to(unmasked_data_coords.device)
         )
@@ -230,6 +224,4 @@ class InitializeState(InitializeStep):
         store.put(self.out_loc_store, {"coords": interpolant}, step_num=0)
 
 
-InitializeStepType = Annotated[
-    InitializeFeatures | InitializeUnconditionalPocketFeatures | InitializeState, Field(discriminator="type")
-]
+InitializeStepType = Annotated[InitializeFeatures | InitializeState, Field(discriminator="type")]

@@ -4,31 +4,32 @@ from dynopsi.data.constants import ATOM37_ORDER, AtomFilter
 
 
 def reshape_coords_for_model(coords: torch.Tensor, frames_idx: torch.Tensor, atoms: AtomFilter) -> torch.Tensor:
-    """Extract and return backbone frame coordinates in model-compatible shape.
+    """Extract and return frame coordinates in model-compatible shape.
 
-    Uses `frames_idx` tensor to extract backbone frame (N-CA-C) atoms for
-    each residue from `coords`. Returns backbone atom 3D coordinates flattened
-    per residue.
+    Uses `frames_idx` tensor to extract per-residue frame atoms from `coords`.
+    For BB, each frame is [N, CA, C]. For CA, each frame is [CA].
+    Returns flattened atom 3D coordinates per residue.
 
     Parameters
     ----------
     coords : torch.Tensor
         Atom 3D coordinates with shape `(batch_size, 1, num_atoms, 3)`.
     frames_idx : torch.Tensor
-        Index into `coords` to provide backbone atom coordinates,
-        shape `(batch_size, num_residues, 3)`.
+        Index into `coords` to provide per-residue atom coordinates,
+        shape `(batch_size, num_residues, n_frame_atoms)`.
     atoms : AtomFilter
-        Which atoms to include; must be `AtomFilter.BB`.
+        Which atoms to include; supported values are `AtomFilter.BB` and
+        `AtomFilter.CA`.
 
     Returns
     -------
     torch.Tensor
-        Backbone coordinates of shape `(batch_size, num_residues, 9)`.
+        Frame coordinates of shape `(batch_size, num_residues, 3 * n_frame_atoms)`.
 
     Raises
     ------
     ValueError
-        If `atoms` is not `AtomFilter.BB`.
+        If `atoms` is not one of the supported atom filters.
     """
     batch_size = frames_idx.shape[0]
     seq_len = frames_idx.shape[1]
@@ -38,7 +39,7 @@ def reshape_coords_for_model(coords: torch.Tensor, frames_idx: torch.Tensor, ato
     backbone_coords = torch.gather(coords, dim=2, index=frames_idx_expand).reshape(
         batch_size, seq_len, -1
     )  # shape: (batch_size, seq_len, 3 * 3)
-    if atoms == AtomFilter.BB:
+    if atoms in (AtomFilter.BB, AtomFilter.CA):
         return backbone_coords
     else:
         raise ValueError(f"Unsupported atoms == {atoms}")
@@ -62,6 +63,8 @@ def center_coordinates(atom_coords: torch.Tensor, atom_center_mask: torch.Tensor
     torch.Tensor:
         The centered coordinates, shape `(1, num_atoms, 3)`.
     """
+    if not atom_center_mask.any():
+        raise ValueError("No atoms to center on")
     atom_center_mask = atom_center_mask.unsqueeze(0).unsqueeze(2)  # (1, num_atoms, 1)
 
     atom_center_mean = torch.sum(atom_coords * atom_center_mask, dim=1, keepdim=True) / torch.sum(
@@ -133,7 +136,6 @@ def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
         Rotation matrices as tensor of shape (..., 3, 3).
     """
     r, i, j, k = torch.unbind(quaternions, -1)
-    # pyre-fixme[58]: `/` is not supported for operand types `float` and `Tensor`.
     two_s = 2.0 / (quaternions * quaternions).sum(-1)
 
     o = torch.stack(

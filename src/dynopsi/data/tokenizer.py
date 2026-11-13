@@ -49,7 +49,6 @@ class StructureTokenFeatures(TokenFeatures):
     token_index: torch.Tensor, ints, [num_residues]. The 0-indexed token index for the residue, which includes pad tokens.
     residue_index: torch.Tensor, ints, [num_residues]. The 0-indexed residue index for the residue, which does not include pad tokens.
     auth_residue_index: torch.Tensor, ints, [num_residues]. The residue index as defined by the mmCif input file. This may contain gaps.
-
     # chain id features
     asym_id: torch.Tensor, ints, [num_residues]
     auth_asym_id: torch.Tensor, ints, [num_residues]
@@ -89,7 +88,7 @@ class StructureTokenFeatures(TokenFeatures):
 class FrameStructureTokenFeatures(StructureTokenFeatures):
     """
     Represents the tokenized version of a structure that includes residue frames.
-    Relevant for backbone only and all-atom tokenization.
+    Relevant for CA-only, backbone-only, and all-atom tokenization.
 
     frames_idx: torch.Tensor, ints, size [num_residues, 3]
        - atom indices, grouped by frame (residue)
@@ -135,10 +134,10 @@ class DynoPsiTokenizer(Tokenizer):
         """
         Attributes
         ----------
-            atom_filter: AtomFilter, an Enum that defines which atoms will be extracted during tokenization
-            - FULL: all atoms --> structure component will return a FrameStructureTokenFeatures object
-            - BB: backbone atoms (N, CA, C) --> structure component will return a FrameStructureTokenFeatures object
-            - CA: CA atoms only --> structure component will return a StructureTokenFeatures object
+            atom_filter: AtomFilter that defines which atoms are extracted.
+            - FULL: all atoms (not implemented).
+            - BB: backbone atoms (N, CA, C).
+            - CA: CA atoms only.
         """
         super().__init__()
         self.atom_filter = atom_filter
@@ -170,8 +169,6 @@ class DynoPsiTokenizer(Tokenizer):
 
         # masks
         token_resolved_mask = from_numpy(structure.residues["ca_present"].copy()).to(torch.float32)
-        # padding mask (initialized to all True)
-        # should we do this here or in a separate cropping + padding step?
         token_pad_mask = torch.full((len(structure.residues),), 1.0, dtype=torch.float32)
 
         # per-residue sequence type features
@@ -179,61 +176,50 @@ class DynoPsiTokenizer(Tokenizer):
         res_encode = one_hot(res_type, num_classes=len(constants.TOKENS))
 
         # atom index features require filtering to the appropriate atoms first
-        include_atom_mask = np.in1d(structure.atoms["atom_name"], np.array(self.atom_filter.to_atom_names()))
+        include_atom_mask = np.isin(structure.atoms["atom_name"], np.array(self.atom_filter.to_atom_names()))
         structure_atoms = structure.atoms[include_atom_mask]
 
         # coordinates
         coords = from_numpy(structure_atoms["coords"].copy()).unsqueeze(0)
 
-        # compute frames and atom features
+        # compute frame and atom-level features
         if self.atom_filter == AtomFilter.CA:
-            structure_token_features = StructureTokenFeatures(
-                token_index=token_index,
-                residue_index=residue_index,
-                auth_residue_index=auth_residue_index,
-                asym_id=asym_id,
-                auth_asym_id=auth_asym_id,
-                entity_id=entity_id,
-                sym_id=sym_id,
-                token_resolved_mask=token_resolved_mask,
-                token_pad_mask=token_pad_mask,
-                coords=coords,
-            )
-
+            n = len(structure.residues)
+            frames_idx = torch.arange(n, dtype=torch.long).unsqueeze(1)  # [n, 1]
+            atom_to_token = torch.eye(n, dtype=torch.long)  # [n, n]
+            frame_resolved_mask = token_resolved_mask.bool()
+            atom_resolved_mask = token_resolved_mask.bool()
+            atom_pad_mask = token_pad_mask.clone()
         elif self.atom_filter == AtomFilter.BB:
             frames_idx = torch.arange(len(structure_atoms)).reshape(-1, 3)
             atom_to_token = torch.eye(len(structure.residues)).repeat_interleave(3, dim=0).long()
             # masks
             frame_resolved_mask = from_numpy(structure.residues["backbone_present"].copy()).bool()
             atom_resolved_mask = from_numpy(structure_atoms["is_present"].copy()).bool()
-
-            # padding mask (initialized to all True)
-            # should we do this here or in a separate cropping + padding step?
             atom_pad_mask = torch.full((len(structure_atoms),), 1.0, dtype=torch.float32)
-
-            structure_token_features = FrameStructureTokenFeatures(
-                token_index=token_index,
-                residue_index=residue_index,
-                auth_residue_index=auth_residue_index,
-                asym_id=asym_id,
-                auth_asym_id=auth_asym_id,
-                entity_id=entity_id,
-                sym_id=sym_id,
-                token_resolved_mask=token_resolved_mask,
-                token_pad_mask=token_pad_mask,
-                coords=coords,
-                frames_idx=frames_idx,
-                atom_to_token=atom_to_token,
-                frame_resolved_mask=frame_resolved_mask,
-                atom_resolved_mask=atom_resolved_mask,
-                atom_pad_mask=atom_pad_mask,
-            )
-
         elif self.atom_filter == AtomFilter.FULL:
-            raise NotImplementedError("Full atom filter not implemented yet")
+            raise NotImplementedError("Full atom coordinates are not supported")
 
         else:
             raise ValueError(f"Invalid atom filter: {self.atom_filter}")
+
+        structure_token_features = FrameStructureTokenFeatures(
+            token_index=token_index,
+            residue_index=residue_index,
+            auth_residue_index=auth_residue_index,
+            asym_id=asym_id,
+            auth_asym_id=auth_asym_id,
+            entity_id=entity_id,
+            sym_id=sym_id,
+            token_resolved_mask=token_resolved_mask,
+            token_pad_mask=token_pad_mask,
+            coords=coords,
+            frames_idx=frames_idx,
+            atom_to_token=atom_to_token,
+            frame_resolved_mask=frame_resolved_mask,
+            atom_resolved_mask=atom_resolved_mask,
+            atom_pad_mask=atom_pad_mask,
+        )
 
         # get sequence features
         sequence_token_features = OneHotSequenceTokenFeatures(res_type=res_type, res_encode=res_encode)

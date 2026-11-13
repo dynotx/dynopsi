@@ -1,9 +1,9 @@
 from collections.abc import Iterable, Iterator
-from typing import Literal, NamedTuple
+from copy import deepcopy
+from typing import Any, Literal, NamedTuple, Self, cast
 
 import torch
 from pydantic import Field, field_validator, model_validator
-from typing_extensions import Self
 
 from dynopsi.data.constants import (
     AtomFilter,
@@ -84,8 +84,8 @@ class InpaintFeaturizer(Featurizer):
         """
         parsed_positions = []
         for pos in v:
-            if isinstance(pos, str):
-                pos = ChainResidueRepr.from_string(pos)
+            if not isinstance(pos, ChainResidueRepr):
+                pos = ChainResidueRepr.model_validate(pos)
             if not pos.is_contiguous:
                 raise ValueError("inpainting positions must be contiguous segments")
             parsed_positions.append(pos)
@@ -100,16 +100,16 @@ class InpaintFeaturizer(Featurizer):
 
         return self
 
-    def _extract_inpaint_regions(self, feature_dict: dict[str, torch.Tensor]) -> list[InpaintTokenIndexInfo]:
+    def _extract_inpaint_regions(self, features: Features) -> list[InpaintTokenIndexInfo]:
         """Translate inpainting configuration into a list of InpaintTokenIndexInfo objects
 
         The inpainting configuration consists of the `inpaint_positions`, `inpaint_lengths`, and `inpaint_segments_centers_of_mass`,
-        and the `InpaintTokenIndexInfo` objects describe the inpainting segments with respect to the input features (feature_dict).
+        and the `InpaintTokenIndexInfo` objects describe the inpainting segments with respect to the input features.
 
         Parameters
         ----------
-        feature_dict: dict[str, torch.Tensor]
-            Required keys: `asym_id`, `{self.index_type}`, `token_pad_mask`.
+        features: Features
+            Required keys: `asym_id` or `auth_asym_id`, `original_residue_index` or `auth_residue_index`, `token_pad_mask`.
 
         Returns
         -------
@@ -120,21 +120,7 @@ class InpaintFeaturizer(Featurizer):
         for chain_repr, feature_length, inpaint_region_center_of_mass in zip(
             self.inpainting_positions, self.inpainting_lengths, self.inpaint_region_centers_of_mass
         ):
-            # get a mask corresponding to the positions to be inpainted
-            # whether this mask is computed based on the original_residue_index or auth_residue_index depends on the config
-            if self.index_type == "auth_residue_index":
-                asym_id_type = "auth_asym_id"
-            else:
-                asym_id_type = "asym_id"
-            position_mask = chain_repr.to_mask(
-                feature_dict[asym_id_type],
-                feature_dict[self.index_type],
-                feature_dict["token_pad_mask"],
-                index_type=self.index_type,
-            )
-
-            inpaint_start_idx = int(torch.where(position_mask)[0].min().long().item())
-            inpaint_end_idx = int(torch.where(position_mask)[0].max().long().item()) + 1
+            inpaint_start_idx, inpaint_end_idx = self._segment_token_bounds(features, chain_repr)
 
             inpaint_regions.append(
                 InpaintTokenIndexInfo(
@@ -153,6 +139,44 @@ class InpaintFeaturizer(Featurizer):
         inpaint_regions.sort(key=lambda x: x.start_idx)
 
         return inpaint_regions
+
+    def _segment_token_bounds(self, features: Features, chain_repr: ChainResidueRepr) -> tuple[int, int]:
+        """Return the (start, end) token bounds of ``chain_repr`` in ``features`` (end exclusive)."""
+        feature_dict = features.feature_dict
+        asym_id_type = "auth_asym_id" if self.index_type == "auth_residue_index" else "asym_id"
+        position_mask = chain_repr.to_mask(
+            feature_dict[asym_id_type],
+            feature_dict[self.index_type],
+            feature_dict["token_pad_mask"],
+            index_type=self.index_type,
+            auth_chain_id_table=features.resolved_auth_chain_id_table(),
+        )
+        indices = torch.where(position_mask)[0]
+        if indices.numel() == 0 or indices[-1] - indices[0] + 1 != indices.numel():
+            raise ValueError("Inpaint positions must form one contiguous run of tokens")
+        start_idx = int(indices[0].long().item())
+        end_idx = int(indices[-1].long().item()) + 1
+        return start_idx, end_idx
+
+    @staticmethod
+    def _segment_center_of_mass(dict_features: dict[str, torch.Tensor], start_idx: int, end_idx: int) -> torch.Tensor:
+        """Mean coordinate of the resolved atoms in tokens ``[start_idx, end_idx)``, shape ``(3,)``."""
+        atom_mask = (dict_features["atom_to_token"][:, start_idx:end_idx].sum(dim=1) > 0) & dict_features[
+            "atom_resolved_mask"
+        ].bool()
+        return dict_features["coords"][0][atom_mask].mean(dim=0)
+
+    def computed_region_centers_of_mass(self, features: Features) -> tuple[torch.Tensor, ...]:
+        """Per-segment COM computed from the segment's resolved atoms, in ``inpainting_positions`` order.
+
+        Mirrors the ``center_of_mass is None`` branch of :meth:`_make_inpaint_feature_segment`, so a
+        caller can offset these base placement pins (e.g. the shared prior-COM sampling jitter) and
+        pass the result back as ``inpaint_region_centers_of_mass`` without re-deriving them.
+        """
+        return tuple(
+            self._segment_center_of_mass(features.feature_dict, *self._segment_token_bounds(features, chain_repr))
+            for chain_repr in self.inpainting_positions
+        )
 
     def _make_inpaint_feature_segment(
         self, dict_features: dict[str, torch.Tensor], segment_params: InpaintTokenIndexInfo
@@ -205,20 +229,19 @@ class InpaintFeaturizer(Featurizer):
         else:
             segment_feature_values["inpaint_feature"] = InpaintFeature.TARGET_INPAINT
 
-        # determine other values for the segment
+        # A same-length target inpaint may keep a per-token pocket label.
+        allow_varying_pocket = (end_idx - start_idx == segment_length) and (
+            segment_feature_values["inpaint_feature"] == InpaintFeature.TARGET_INPAINT
+        )
+        set_pocket_feature_exactly = False
         for k in ["asym_id", "auth_asym_id", "entity_id", "sym_id", "pocket_feature", "binder_mask", "target_mask"]:
-            if dict_features[k][start_idx:end_idx].unique().shape[0] > 1:
-                # specifically check the TARGET_INPAINT case, in which case a POCKET could be specified if the segment_length doesn't change
-                if (end_idx - start_idx == segment_length) and (
-                    segment_feature_values["inpaint_feature"] == InpaintFeature.TARGET_INPAINT
-                ):
+            segment_values = dict_features[k][start_idx:end_idx]
+            if segment_values.unique().shape[0] > 1:
+                if k == "pocket_feature" and allow_varying_pocket:
                     set_pocket_feature_exactly = True
                 else:
                     raise ValueError(f"Inpaint feature {k} has multiple unique values in the segment")
-            else:
-                segment_feature_values[k] = int(dict_features[k][start_idx].item())
-                if k == "pocket_feature":
-                    set_pocket_feature_exactly = False
+            segment_feature_values[k] = int(dict_features[k][start_idx].item())
 
         # obtain the coords center of mass
         # if the inpaint region center of mass is specified, use it
@@ -226,10 +249,7 @@ class InpaintFeaturizer(Featurizer):
         if segment_params.center_of_mass is not None:
             coords_center_of_mass = segment_params.center_of_mass
         else:
-            atom_mask = (dict_features["atom_to_token"][:, start_idx:end_idx].sum(dim=1) > 0) & dict_features[
-                "atom_resolved_mask"
-            ].bool()
-            coords_center_of_mass = dict_features["coords"][0][atom_mask].mean(dim=0)
+            coords_center_of_mass = self._segment_center_of_mass(dict_features, start_idx, end_idx)
 
         # determine the keys to include
         keys_to_include = list(dict_features.keys()) + ["inpaint_feature"]
@@ -332,16 +352,27 @@ class InpaintFeaturizer(Featurizer):
                 if "auth_residue_index" not in new_features.keys():
                     raise ValueError("auth_residue_index is not present in the features")
 
-            inpaint_regions = self._extract_inpaint_regions(new_features.feature_dict)
-
+            inpaint_regions = self._extract_inpaint_regions(new_features)
             # initialize a list to store the features to concatenate
             features_to_concat = []
 
-            # start at the 0th token position and iterate to the right, constructing context feature segments and inpaint feature segments
+            # Iterate left-to-right across all tokens, slicing out alternating context and inpaint segments.
+            # residue_index_offset tracks the net change in chain length accumulated so far from all inpaint
+            # regions processed in this loop. It is applied to every segment so that residue indices remain
+            # monotonically ordered within the inpainted chain:
+            #   - Context segments: residue_index values are taken directly from the input feature dict
+            #     (already 0-based per chain) and shifted right by the accumulated offset. This keeps them
+            #     consecutive with the inpaint segment that preceded them.
+            #   - Inpaint segments: residue_index starts at 0 (from make_empty_chain). It is shifted to
+            #     original_residue_index[start_idx] + accumulated_offset so that the new segment is
+            #     positioned immediately after the preceding context within the inpainted chain.
+            # Because residue_index_offset is a single scalar shared across all chains, it is also applied
+            # to context tokens belonging to chains that are not being inpainted. Those tokens do not need
+            # any shift; this spurious offset is corrected by reset_residue_index=True in concat_features below.
             context_start_idx = 0
+            residue_index_offset = 0
             for inpaint_segment_params in inpaint_regions:
                 context_end_idx = inpaint_segment_params.start_idx  # left-inclusive, right-exclusive
-                # if there is context to the left of the features, construct it
                 if context_end_idx > context_start_idx:
                     context_segment_params = InpaintTokenIndexInfo(
                         start_idx=context_start_idx,
@@ -352,16 +383,21 @@ class InpaintFeaturizer(Featurizer):
                     context_features = self._make_context_feature_segment(
                         new_features.feature_dict, context_segment_params
                     )
+                    context_features["residue_index"] += residue_index_offset
                     features_to_concat.append(context_features)
 
-                # add the inpaint feature
                 inpaint_features = self._make_inpaint_feature_segment(new_features.feature_dict, inpaint_segment_params)
+                starting_residue_index = new_features.feature_dict["original_residue_index"][
+                    inpaint_segment_params.start_idx
+                ]
+                inpaint_features["residue_index"] += starting_residue_index + residue_index_offset
+                residue_index_offset += inpaint_segment_params.feature_length - (
+                    inpaint_segment_params.end_idx - inpaint_segment_params.start_idx
+                )
                 features_to_concat.append(inpaint_features)
 
-                # update the context start index
                 context_start_idx = inpaint_segment_params.end_idx
 
-            # add the final context segment if there are any tokens to the right of the inpainting regions
             if context_start_idx < len(new_features.feature_dict["asym_id"]):
                 end_pos = len(new_features.feature_dict["asym_id"])
                 context_segment_params = InpaintTokenIndexInfo(
@@ -371,15 +407,46 @@ class InpaintFeaturizer(Featurizer):
                     center_of_mass=None,
                 )
                 context_features = self._make_context_feature_segment(new_features.feature_dict, context_segment_params)
+                context_features["residue_index"] += residue_index_offset
                 features_to_concat.append(context_features)
 
-            # concatenate all the features to get the final output features
-            # don't update the asym_id or entity_id, because we are explicitly constructing them to be the same as their parent chains
-            # do reset the residue_index because the sequence length can change and we don't want duplicates or missing residues
+            # Concatenate segments and normalize residue_index to be 0-based and consecutive per chain.
+            # reset_residue_index=True serves two roles here:
+            #   1. Inpainted chains: the loop above positions each segment so blocks within the chain are already
+            #      consecutive, so the only work is subtracting the minimum of the first block to start at 0.
+            #   2. Non-inpainted chains: the spurious residue_index_offset applied to their context tokens
+            #      above is undone by subtracting the minimum of each chain's first block back to 0.
+            # asym_id and entity_id are not made unique because we explicitly construct them to match the
+            # parent chains.
             new_features.feature_dict = concat_features(
                 features_to_concat, make_asym_ids_unique=False, make_entity_ids_unique=False, reset_residue_index=True
             )
 
-            self._update_features_metadata(new_features)
+            more_metadata: dict[str, Any] = {}
+
+            if new_features.input_reference_structure is not None and len(self.inpainting_positions) > 0:
+                structure_index_type = cast(
+                    Literal["residue_index", "auth_residue_index"],
+                    {
+                        "original_residue_index": "residue_index",
+                        "auth_residue_index": "auth_residue_index",
+                    }[self.index_type],
+                )
+                new_structure = new_features.input_reference_structure.inpaint(
+                    inpainting_regions=self.inpainting_positions,
+                    region_lengths=self.inpainting_lengths,
+                    index_type=structure_index_type,
+                )
+
+                new_features.input_reference_structure = new_structure
+                if self.verbose_metadata:
+                    more_metadata["structure"] = new_structure
+            elif self.verbose_metadata:
+                if new_features.input_reference_structure is not None:
+                    more_metadata["structure"] = deepcopy(new_features.input_reference_structure)
+                else:
+                    more_metadata["structure"] = None
+
+            self._update_features_metadata(new_features, more_metadata=more_metadata)
 
             yield new_features

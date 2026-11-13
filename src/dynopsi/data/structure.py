@@ -1,29 +1,37 @@
 import logging
-from dataclasses import asdict, dataclass
+from collections import defaultdict
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import numpy as np
 import smart_open
 import torch
 from torch import from_numpy
-from typing_extensions import Self
 
+from dynopsi.data.auth_chain_identity import (
+    AUTH_CHAIN_ID_MAX_LENGTH,
+    auth_chain_id_table_from_chains,
+    resolve_unique_letter_auth_int,
+)
 from dynopsi.data.constants import AtomFilter
-from dynopsi.data.utils import ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP, ChainResidueRepr, align_by_mask
+from dynopsi.data.utils import (
+    ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP,
+    ChainResidueRepr,
+    align_by_mask,
+    get_asym_id_from_chain_id,
+)
 
 logger = logging.getLogger(__name__)
 
 CHAINS_DTYPE = np.dtype(
     [
-        # alpha chain id, we only allow single letter chain ids
-        ("chain_id", "<U1"),
-        # auth_chain_id: the author-provided chain_id of the chain
-        ("auth_chain_id", "<U1"),
-        # asym_id; we will only allow asym_ids 0-25
-        ("asym_id", "i1"),
+        ("chain_id", "<U4"),
+        # author chain id; construction rejects anything longer than AUTH_CHAIN_ID_MAX_LENGTH
+        ("auth_chain_id", f"<U{AUTH_CHAIN_ID_MAX_LENGTH}"),
+        ("asym_id", "i4"),
         # auth_asym_id: the author-provided asym_id of the chain
-        ("auth_asym_id", "i1"),
+        ("auth_asym_id", "i4"),
         # entity_id: the number is constrained by the asym_id
         ("entity_id", "i1"),
         # sym_id: the number is constrained by the asym_id
@@ -131,7 +139,6 @@ DYNO_PSI_FEATURES_DTYPE = np.dtype(
 @dataclass(frozen=True, slots=True)
 class Chain:
     """A chain object.
-
     Attributes
     ----------
     name: str, the PDB-standard chain name
@@ -200,6 +207,21 @@ class Structure:
         """Dump the structure to an NPZ file."""
         np.savez_compressed(str(path), **asdict(self))
 
+    def with_sequential_auth_res_idx(self) -> Self:
+        """Return a copy of the Structure instance whose ``auth_res_idx`` equals ``res_idx``."""
+        residues = self.residues.copy()
+        residues["auth_res_idx"] = residues["res_idx"].copy()
+        return replace(self, residues=residues)
+
+    @staticmethod
+    def residues_for_chain(residues: np.ndarray, chain: np.ndarray) -> np.ndarray:
+        """Return the residue rows owned by one chain record."""
+        start = int(chain["res_start_idx"])
+        return residues[start : start + int(chain["num_residues"])]
+
+    def chain_residues(self, chain: np.ndarray) -> np.ndarray:
+        return self.residues_for_chain(self.residues, chain)
+
     def get_auth_chain_id_to_pdb_chain_id_map(self) -> dict[str, str]:
         """Get a map from auth_chain_id to pdb_chain_id."""
         return {str(chain["auth_chain_id"]): str(chain["chain_id"]) for chain in self.chains}
@@ -209,8 +231,11 @@ class Structure:
         return {str(chain["chain_id"]): str(chain["auth_chain_id"]) for chain in self.chains}
 
     @staticmethod
-    def update_start_indices(
-        chains: np.ndarray, residues: np.ndarray, atoms: np.ndarray
+    def rebuild_structure_arrays(
+        chains: np.ndarray,
+        residues: np.ndarray,
+        atoms: np.ndarray,
+        reset_residue_index: bool,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Update fields in the chains, residues, and atoms arrays after resizing (crop or concatenation).
 
@@ -218,13 +243,14 @@ class Structure:
         - `residues.atom_start_idx`, `residues.atom_center` to reflect the changes in `atom` array
         - `chains.atom_start_idx`, `chains.num_atoms` to reflect the changes in `atom` array
         - `chains.res_start_idx`, `chains.num_residues` to reflect the changes in `residue` array
-        - `residues.res_idx` and `atoms.res_idx` to reset res_idx to 0 at the start of each chain
 
         Parameters
         ----------
         chains: np.ndarray of CHAINS_DTYPE
         residues: np.ndarray of RESIDUES_DTYPE
         atoms: np.ndarray of ATOMS_DTYPE
+        reset_residue_index: bool
+            Whether to reset the residue index to start at 0 for each chain.
 
         Returns
         -------
@@ -253,10 +279,10 @@ class Structure:
             chains["num_atoms"][chains["asym_id"] == asym_id] = len(asym_id_atoms)
             chains["num_residues"][chains["asym_id"] == asym_id] = len(asym_id_residues)
 
-            # update the res_idx to start from 0 for the chain
-            chain_min_res_idx = np.min(asym_id_residues["res_idx"])
-            residues["res_idx"][residues["asym_id"] == asym_id] -= chain_min_res_idx
-            atoms["res_idx"][atoms["asym_id"] == asym_id] -= chain_min_res_idx
+            if reset_residue_index:
+                min_res_idx = residues["res_idx"][residues["asym_id"] == asym_id].min()
+                residues["res_idx"][residues["asym_id"] == asym_id] -= min_res_idx
+                atoms["res_idx"][atoms["asym_id"] == asym_id] -= min_res_idx
 
         return chains, residues, atoms
 
@@ -275,9 +301,6 @@ class Structure:
         new_chains["asym_id"] = [ref_asym_id_map[asym_id] for asym_id in self.chains["asym_id"]]
         new_chains["auth_asym_id"] = [auth_asym_id_map[auth_asym_id] for auth_asym_id in self.chains["auth_asym_id"]]
         new_chains["chain_id"] = [ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP[asym_id] for asym_id in new_chains["asym_id"]]
-        new_chains["auth_chain_id"] = [
-            ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP[auth_asym_id] for auth_asym_id in new_chains["auth_asym_id"]
-        ]
 
         new_residues = self.residues.copy()
         new_residues["asym_id"] = [ref_asym_id_map[asym_id] for asym_id in self.residues["asym_id"]]
@@ -315,6 +338,7 @@ class Structure:
     def crop(
         self,
         residue_index_chain_spec: ChainResidueRepr | dict[str, Any],
+        reset_residue_index: bool,
         index_type: Literal["residue_index", "auth_residue_index"] = "residue_index",
         inverse_crop: bool = False,
     ) -> Self:
@@ -331,10 +355,13 @@ class Structure:
             The type of index to use for the residue index chain specification.
         inverse_crop : bool, default False
             Whether to inverse the crop, i.e. crop the structure to the complement of the residue index chain specification.
+        reset_residue_index: bool
+            Whether to reset the residue index to start at 0 for each chain.
 
         Returns
         -------
         A new Structure with the cropped residues, atoms, and chains. The res_idx field will be reset to start at 0 for each asym_id.
+        Some structure attribues are always set to empty arrays: interfaces, residue_interfaces, and features.
         """
         if isinstance(residue_index_chain_spec, dict):
             chain_residue_rep = ChainResidueRepr.model_validate(residue_index_chain_spec)
@@ -351,18 +378,18 @@ class Structure:
 
         res_idx_tensor = from_numpy(self.residues[idx_attr].copy())
         asym_id_tensor = from_numpy(np.repeat(self.chains[asym_id_attr], self.chains["num_residues"]))
-
         residue_keep_mask = chain_residue_rep.to_mask(
             asym_id=asym_id_tensor,
             residue_index=res_idx_tensor,
             pad_mask=torch.ones(len(self.residues), dtype=torch.bool),
             index_type=index_type,
+            auth_chain_id_table=auth_chain_id_table_from_chains(self.chains),
         )
         if inverse_crop:
             residue_keep_mask = ~residue_keep_mask
         residues = self.residues[residue_keep_mask.numpy()]
 
-        # now atoms based on present residues
+        # update atoms based on present residues
         atom_keep_mask = np.zeros(self.atoms.shape[0]).astype(bool)
         for asym_id in np.unique(residues["asym_id"]):
             res_present = residues[residues["asym_id"] == asym_id]["res_idx"]
@@ -373,13 +400,9 @@ class Structure:
 
         chains = self.chains[np.isin(self.chains["asym_id"], residues["asym_id"])]
 
-        chains, residues, atoms = self.update_start_indices(chains, residues, atoms)
-
-        if len(self.features) == len(residues):
-            # features are either empty or same size as residues
-            features = self.features[residue_keep_mask.numpy()]
-        else:
-            features = np.empty(0, dtype=DYNO_PSI_FEATURES_DTYPE)
+        chains, residues, atoms = self.rebuild_structure_arrays(
+            chains, residues, atoms, reset_residue_index=reset_residue_index
+        )
 
         return self.__class__(
             atoms=atoms,
@@ -387,40 +410,279 @@ class Structure:
             chains=chains,
             interfaces=np.empty(0, dtype=CHAIN_INTERFACE_DTYPE),
             residue_interfaces=np.empty(0, dtype=RESIDUE_INTERFACE_DTYPE),
-            features=features,
+            features=np.empty(0, dtype=DYNO_PSI_FEATURES_DTYPE),
         )
 
-    def concat(self, other: Self) -> Self:
+    def inpaint(
+        self,
+        inpainting_regions: tuple[ChainResidueRepr, ...],
+        region_lengths: tuple[int, ...],
+        index_type: Literal["residue_index", "auth_residue_index"] = "residue_index",
+        reset_residue_index: bool = True,
+    ) -> Self:
+        """Return a new Structure with inpainted residues removed and residue indices
+        updated to reflect inpainted segment lengths.
+
+        Parameters
+        ----------
+        inpainting_regions : tuple[ChainResidueRepr, ...]
+            Inpainting regions in order. Each specifies which residues to mask.
+        region_lengths : tuple[int, ...]
+            Number of residues to inpaint per region. Must have the same length and be
+            in the same order as ``inpainting_regions``.
+        index_type : Literal["residue_index", "auth_residue_index"]
+            Which residue index scheme to use when interpreting ``inpainting_regions``.
+        reset_residue_index: bool, default True
+            Whether to reset the residue index to start at 0 for each chain.
+
+        Returns
+        -------
+        A new Structure with inpainting regions removed. If reset_residue_index is True, residue index
+        information is reset such that chains start at 0 and residue indices are updated to reflect the
+        size and location of the inpainted regions. The relative sizes of chain breaks in the original
+        context regions are still preserved.
+        Some structure attribues are always set to empty arrays: interfaces, residue_interfaces, and features.
+        """
+        if len(inpainting_regions) != len(region_lengths):
+            raise ValueError(
+                f"inpainting_regions and region_lengths must have the same length, "
+                f"got {len(inpainting_regions)} and {len(region_lengths)}"
+            )
+
+        if index_type == "auth_residue_index":
+            idx_attr = "auth_res_idx"
+            asym_id_attr = "auth_asym_id"
+        else:
+            idx_attr = "res_idx"
+            asym_id_attr = "asym_id"
+
+        # Work on local copies so that inpainting never mutates `self`.
+        base_structure = self.__class__(
+            atoms=self.atoms.copy(),
+            residues=self.residues.copy(),
+            chains=self.chains.copy(),
+            interfaces=np.empty(0, dtype=CHAIN_INTERFACE_DTYPE),
+            residue_interfaces=np.empty(0, dtype=RESIDUE_INTERFACE_DTYPE),
+            features=self.features.copy(),
+        )
+
+        res_idx_tensor = from_numpy(base_structure.residues[idx_attr].copy())
+        asym_id_tensor = from_numpy(
+            np.repeat(base_structure.chains[asym_id_attr], base_structure.chains["num_residues"])
+        )
+        pad_mask = torch.ones(len(base_structure.residues), dtype=torch.bool)
+        auth_table = auth_chain_id_table_from_chains(base_structure.chains)
+
+        inpaint_region_masks = [
+            region.to_mask(
+                asym_id=asym_id_tensor,
+                residue_index=res_idx_tensor,
+                pad_mask=pad_mask,
+                index_type=index_type,
+                auth_chain_id_table=auth_table,
+            )
+            for region in inpainting_regions
+        ]
+        if len(inpaint_region_masks) == 0:
+            raise ValueError("No inpainting regions provided.")
+
+        inpaint_region_merge = torch.stack(inpaint_region_masks).sum(dim=0).bool()
+
+        inpaint_region_crr = ChainResidueRepr.from_asym_id_mask(
+            inpaint_region_merge,
+            asym_id=asym_id_tensor,
+            residue_index=res_idx_tensor,
+            index_type=index_type,
+            asym_id_map=auth_table if asym_id_attr == "auth_asym_id" else None,
+        )
+
+        cropped_structure = base_structure.crop(
+            inpaint_region_crr, index_type=index_type, inverse_crop=True, reset_residue_index=False
+        )
+        # Ensure subsequent index updates do not mutate arrays shared with `self`.
+        cropped_structure = self.__class__(
+            atoms=cropped_structure.atoms.copy(),
+            residues=cropped_structure.residues.copy(),
+            chains=cropped_structure.chains.copy(),
+            interfaces=np.empty(0, dtype=CHAIN_INTERFACE_DTYPE),
+            residue_interfaces=np.empty(0, dtype=RESIDUE_INTERFACE_DTYPE),
+            features=np.empty(0, dtype=DYNO_PSI_FEATURES_DTYPE),
+        )
+
+        # now update the res_idx to reflect the position in the chain, 0-indexed, given inpainted regions
+        asym_id_to_chain_residue_repr = defaultdict(list)
+        for crr, length in zip(inpainting_regions, region_lengths):
+            chain_id = next(iter(crr.chain_ids))
+            if index_type == "auth_residue_index":
+                crr_asym_id = resolve_unique_letter_auth_int(chain_id, auth_table or {})
+            else:
+                crr_asym_id = get_asym_id_from_chain_id(chain_id)
+            asym_id_to_chain_residue_repr[crr_asym_id].append((crr, length))
+
+        res_idx_new_lst = []
+        for asym_id in base_structure.chains[asym_id_attr]:
+            asym_id_mask = asym_id_tensor == asym_id
+            # get the chain 0-indexed positions corresponding to the inpainting regions
+            # also track their length
+            inpaint_positions_and_length = [
+                (
+                    torch.where(
+                        region.to_mask(
+                            asym_id=asym_id_tensor,
+                            residue_index=res_idx_tensor,
+                            pad_mask=pad_mask,
+                            index_type=index_type,
+                            auth_chain_id_table=auth_table,
+                        )[asym_id_mask]
+                    )[0].numpy(),
+                    length,
+                )
+                for region, length in asym_id_to_chain_residue_repr[asym_id]
+            ]
+            # sort becasue there is no guarantee that the input order is ascending
+            inpaint_positions_and_length.sort(key=lambda x: x[0].min())
+
+            inpaint_or_context_region_lengths: list[int] = []
+            region_is_context: list[bool] = []
+            prev_inpaint_end = 0
+            for inpaint_pos, inpaint_length in inpaint_positions_and_length:
+                context_start = prev_inpaint_end
+                inpaint_start = inpaint_pos.min().item()
+                context_length = inpaint_start - context_start
+                if context_length > 0:
+                    inpaint_or_context_region_lengths.append(context_length)
+                    region_is_context.append(True)
+
+                inpaint_or_context_region_lengths.append(inpaint_length)
+                region_is_context.append(False)
+
+                prev_inpaint_end = inpaint_pos.max() + 1
+
+            # add final context
+            context_start = prev_inpaint_end
+            context_length = (asym_id_mask).sum().item() - context_start
+            if context_length > 0:
+                inpaint_or_context_region_lengths.append(context_length)
+                region_is_context.append(True)
+
+            res_idx_mask = np.repeat(np.array(region_is_context), np.array(inpaint_or_context_region_lengths))
+
+            res_idx_with_inpaint = np.arange(sum(inpaint_or_context_region_lengths))
+
+            context_mask = ~inpaint_region_merge[asym_id_mask]
+            # calculate the differential in the residue index
+            res_idx_context_diff = res_idx_with_inpaint[res_idx_mask] - np.arange(context_mask.shape[0])[context_mask]
+            res_idx_context = base_structure.residues["res_idx"][asym_id_mask][context_mask] + res_idx_context_diff
+
+            # reset the residue index to start at 0 for each chain
+            if reset_residue_index:
+                if len(res_idx_context) > 0:
+                    offset = res_idx_context.min()
+                    if not region_is_context[0]:
+                        # if start with inpainting, then offset needs to adjust for the inpainting region
+                        offset -= inpaint_or_context_region_lengths[0]
+                    res_idx_context -= offset
+
+            res_idx_new_lst.append(res_idx_context)
+
+        res_idx_new = np.concatenate(res_idx_new_lst)
+        cropped_structure.residues["res_idx"] = res_idx_new
+
+        res_idx_new_atoms = np.repeat(res_idx_new, cropped_structure.residues["num_atoms"])
+        cropped_structure.atoms["res_idx"] = res_idx_new_atoms
+
+        return cropped_structure
+
+    def merge(
+        self,
+        other: Self,
+        mode: Literal["inpaint", "concatenate"],
+        reset_residue_index: bool,
+        enforce_distinct_entity_ids: bool = True,
+    ) -> Self:
         """Concatenate this structure with another structure.
 
         Parameters
         ----------
         other : Self
             The other structure to concatenate with.
+        mode : Literal["inpaint", "concatenate"]
+            The mode to use for the merge.
+            - "inpaint": merge the structures by ordering on asym_id and res_idx.
+            - "concatenate": concatenate the structures. Does not allow self and other to have the same asym_id or entity_id.
+        reset_residue_index: bool
+            Whether to reset the residue index to start at 0 for each chain.
+        enforce_distinct_entity_ids: bool
+            In `concatenate` mode, when True this will enforce that the chains in `other` have distinct `entity_id`s
+            compared to the chains in `self`.
+            When False, this check is not performed.
+            Setting this to True is useful to guard against merging structures that should have distinct `entity_id`s but the assigned entity ids happen to collide.
+            Setting this to False is useful for concatenating homo-oligomer chains that share an entity.
 
         Returns
         -------
-        A new
+        A new structure that is the merge of the two original structures. In the 'concatenate'
+        case, chains are directly concatenated. In the 'inpaint' case, the asym_id and res_idx values
+        are appropriately interleaved.
 
         Raises
         ------
-        NotImplementedError
-            If concatenating structures with the same asym_id. There is not currently support for
-            checking for collisions at the residue_index level, so we check that asym_ids are unique.
+        ValueError if mode is not "inpaint" or "concatenate"
+        ValueError if concatenating structures with the same asym_id or entity_id in "concatenate" mode
+        ValueError if there are colliding combinations of asym_id and res_idx in "inpaint" mode
+
+        Some structure attribues are always set to empty arrays: interfaces, residue_interfaces, and features.
         """
-        if np.intersect1d(self.chains["asym_id"], other.chains["asym_id"]).shape[0] > 0:
-            raise NotImplementedError("Concatenating Structures with the same asym_id is not currently supported.")
-        atoms = np.concatenate([self.atoms, other.atoms], axis=0)
-        residues = np.concatenate([self.residues, other.residues], axis=0)
-        chains = np.concatenate([self.chains, other.chains], axis=0)
+        if mode not in ["inpaint", "concatenate"]:
+            raise ValueError(f"Mode {mode} not supported. Only 'inpaint' and 'concatenate' allowed.")
 
-        # only concat features if both are present, otherwise set to empty
-        if len(self.features) == len(self.residues) and len(other.features) == len(other.residues):
-            features = np.concatenate([self.features, other.features])
-        else:
-            features = np.empty(0, dtype=DYNO_PSI_FEATURES_DTYPE)
+        if mode == "concatenate":
+            if np.intersect1d(self.chains["asym_id"], other.chains["asym_id"]).shape[0] > 0:
+                raise ValueError(
+                    "Concatenating Structures with the same asym_id is not valid for 'concatenate' mode. Use 'inpaint' mode instead."
+                )
 
-        chains_out, residues_out, atoms_out = self.update_start_indices(chains=chains, residues=residues, atoms=atoms)
+            if enforce_distinct_entity_ids:
+                if np.intersect1d(self.chains["entity_id"], other.chains["entity_id"]).shape[0] > 0:
+                    raise ValueError(
+                        "Concatenating Structures with the same `entity_id` is not valid for 'concatenate' mode. Use 'inpaint' mode instead."
+                    )
+
+            atoms = np.concatenate([self.atoms, other.atoms], axis=0)
+            residues = np.concatenate([self.residues, other.residues], axis=0)
+            chains = np.concatenate([self.chains, other.chains], axis=0)
+
+        elif mode == "inpaint":
+            atoms = np.concatenate([self.atoms, other.atoms], axis=0)
+            residues = np.concatenate([self.residues, other.residues], axis=0)
+
+            # check that that there aren't duplicated residue:chain
+            resi_chain = residues[["asym_id", "res_idx"]]
+            if resi_chain.shape[0] != np.unique(resi_chain).shape[0]:
+                raise ValueError("There are colliding combinations of asym_id and res_idx.")
+
+            # sort based on chain, res_idx
+            resi_order = np.lexsort((residues["res_idx"], residues["asym_id"]))
+
+            # sort atoms by the same residue key, preserving original intra-residue order
+            orig_atom_idx = np.arange(len(atoms))
+            atom_order = np.lexsort((orig_atom_idx, atoms["res_idx"], atoms["asym_id"]))
+
+            residues = residues[resi_order]
+            atoms = atoms[atom_order]
+
+            # for chains, get a set of all possible chains
+            # then iterate across chains and just select the first
+            full_chain_set = np.concatenate([self.chains, other.chains], axis=0)
+            chain_lst = []
+            for asym_id in np.sort(np.unique(full_chain_set["asym_id"])):
+                chain_subset = full_chain_set[full_chain_set["asym_id"] == asym_id]
+                chain_lst.append(chain_subset[0])
+            chains = np.stack(chain_lst)
+
+        chains_out, residues_out, atoms_out = self.rebuild_structure_arrays(
+            chains=chains, residues=residues, atoms=atoms, reset_residue_index=reset_residue_index
+        )
 
         return self.__class__(
             atoms=atoms_out,
@@ -428,7 +690,7 @@ class Structure:
             chains=chains_out,
             interfaces=np.empty(0, dtype=CHAIN_INTERFACE_DTYPE),
             residue_interfaces=np.empty(0, dtype=RESIDUE_INTERFACE_DTYPE),
-            features=features,
+            features=np.empty(0, dtype=DYNO_PSI_FEATURES_DTYPE),
         )
 
     def align_to_feature_dict(self, feature_dict: dict[str, torch.Tensor], atoms_to_include: AtomFilter) -> Self:
@@ -499,7 +761,7 @@ class Structure:
             atoms=new_atoms,
             interfaces=self.interfaces.copy(),
             residue_interfaces=self.residue_interfaces.copy(),
-            features=self.features.copy(),
+            features=np.empty(0, dtype=DYNO_PSI_FEATURES_DTYPE),
         )
 
 
@@ -527,15 +789,16 @@ class MultiModelStructure:
     def load_from_npz(cls: type[Self], path: Path | str) -> Self:
         with smart_open.open(path, "rb") as f:
             multi_model_structure = np.load(f)
+
             atom_keys_and_idx: list[tuple[str, int]] = [
                 (key, int(key.split("_")[1])) for key in multi_model_structure.keys() if "atoms" in key
             ]
             atom_keys_and_idx = sorted(atom_keys_and_idx, key=lambda x: x[1])
 
             if len(atom_keys_and_idx) == 0:
-                raise ValueError("Invalid input, expected 'atoms_idx' fields")
+                raise ValueError("Invalid input, expected 'atom_' fields")
 
-            kwargs = {key: multi_model_structure[key] for key, _ in atom_keys_and_idx} | {
+            kwargs = {"atoms": [multi_model_structure[key] for key, _ in atom_keys_and_idx]} | {
                 "residues": multi_model_structure["residues"],
                 "chains": multi_model_structure["chains"],
             }

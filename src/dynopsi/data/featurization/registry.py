@@ -38,3 +38,10 @@ def get_featurizer_from_type(featurizer_type: str) -> type[Featurizer]:
 def get_featurizer_from_config(config: dict[str, Any]) -> Featurizer:
     feat_cls = FEATURIZER_REGISTRY[config["type"]]
     return feat_cls.model_validate(config)
+
+
+def get_featurizer_type(featurizer: Featurizer) -> str:
+    type_value = getattr(featurizer, "type", None)
+    if not isinstance(type_value, str):
+        raise ValueError(f"Featurizer {type(featurizer).__name__} must define a string `type` field.")
+    return type_value

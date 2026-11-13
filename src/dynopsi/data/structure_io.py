@@ -5,17 +5,16 @@ import tempfile
 from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
 
 import gemmi
 import numpy as np
 import requests
 import smart_open
-from pdbeccdutils.core import ccd_reader
-from rdkit import Chem
-from rdkit.Chem.rdchem import Mol
 from scipy.spatial import cKDTree
 
 import dynopsi.data.constants as constants
+from dynopsi.data.auth_chain_identity import assign_auth_asym_id, checked_auth_chain_id
 from dynopsi.data.paths import AA_CCD_CIF_FILE
 from dynopsi.data.structure import (
     ATOMS_DTYPE,
@@ -27,15 +26,44 @@ from dynopsi.data.structure import (
     Chain,
     Structure,
 )
+from dynopsi.data.structure_write_policy import enforce_pdb_write_policy, polymer_entities
 from dynopsi.data.utils import get_asym_id_from_chain_id
+
+if TYPE_CHECKING:
+    from rdkit.Chem.rdchem import Mol
+else:
+    Mol = Any
 
 logger = logging.getLogger(__name__)
 
 
 ## Loading Structures
+def _reject_insertion_codes(structure: gemmi.Structure) -> None:
+    """Reject residue identities that DynoPsi cannot represent without ambiguity."""
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                if residue.entity_type != gemmi.EntityType.Polymer:
+                    continue
+                insertion_code = residue.seqid.icode.strip()
+                if insertion_code:
+                    raise ValueError(
+                        f"Insertion-coded residue {chain.name}{residue.seqid.num}{insertion_code} is not supported. "
+                        "Renumber residues without insertion codes before loading the structure."
+                    )
+
+
 def load_or_parse_ccd(ccd_path: Path | str = AA_CCD_CIF_FILE) -> dict[str, Mol]:
     """Load the CCD dictionary of residue name to rdkit.Chem.rdchem.Mol."""
-    components = ccd_reader.read_pdb_components_file(str(AA_CCD_CIF_FILE))
+    try:
+        from pdbeccdutils.core import ccd_reader
+    except ImportError as exc:
+        raise ImportError(
+            "load_or_parse_ccd requires the optional 'structure-parsing' extra "
+            "(pdbeccdutils/rdkit). Install it with `uv sync --extra workspace`."
+        ) from exc
+
+    components = ccd_reader.read_pdb_components_file(str(ccd_path))
     ccd: dict[str, Mol] = {}
     for name, component in components.items():
         mol = component.component.mol
@@ -46,7 +74,12 @@ def load_or_parse_ccd(ccd_path: Path | str = AA_CCD_CIF_FILE) -> dict[str, Mol]:
 
 
 def load_structure_from_cif(
-    cif_path: Path | str, atomic_interface_threshold: float = 10.0, compute_residue_interfaces: bool = True
+    cif_path: Path | str,
+    atomic_interface_threshold: float = 10.0,
+    compute_residue_interfaces: bool = True,
+    allow_nonstandard_residues: bool = False,
+    allow_mismatches: bool = False,
+    use_assembly: bool = False,
 ) -> Structure:
     """
     Load a Structure from a CIF file.
@@ -55,22 +88,21 @@ def load_structure_from_cif(
     ----------
     cif_path : Path
         The path to the CIF file.
-    atomic_interface_threshold: float, default 10.0
-        The threshold for the atom-atom distance for a pair of atoms to be considered at an interface (all sidechains are considered).
-    compute_residue_interfaces: bool, default True
-        Whether to compute the residues at the interface or just the chains at the interface. See find_chain_interfaces for more details.
+
+    See parse_structure_from_gemmi for more parameter details.
 
     Returns
     -------
     Structure
         The loaded structure.
     """
-    ccd = load_or_parse_ccd()
     return parse_mmcif(
         cif_path,
-        ccd,
         atomic_interface_threshold=atomic_interface_threshold,
         compute_residue_interfaces=compute_residue_interfaces,
+        allow_nonstandard_residues=allow_nonstandard_residues,
+        allow_mismatches=allow_mismatches,
+        use_assembly=use_assembly,
     )
 
 
@@ -79,6 +111,9 @@ def load_structure_from_pdb(
     chain_id_to_sequence: dict[str, str] | None = None,
     atomic_interface_threshold: float = 10.0,
     compute_residue_interfaces: bool = True,
+    allow_nonstandard_residues: bool = False,
+    allow_mismatches: bool = False,
+    use_assembly: bool = False,
 ) -> Structure:
     """
     Load a Structure from a PDB file.
@@ -95,23 +130,23 @@ def load_structure_from_pdb(
         If provided, then chains with the same sequence will be assigned to the same entity. It is recommended that
         you check the cif output file to ensure that the sequences and positions are correct if you provide this argument.
         If None, then the sequences will be inferred from the residues and each chain will be assigned a separate entity.
-    atomic_interface_threshold: float, default 10.0
-        The threshold for the atom-atom distance for a pair of atoms to be considered at an interface (all sidechains are considered).
-    compute_residue_interfaces: bool, default True
-        Whether to compute the residues at the interface or just the chains at the interface. See find_chain_interfaces for more details.
+
+
+    See parse_structure_from_gemmi for more parameter details.
 
     Returns
     -------
     Structure
         The loaded structure.
     """
-    ccd = load_or_parse_ccd()
     return parse_pdb(
         pdb_path,
-        ccd,
         chain_id_to_sequence=chain_id_to_sequence,
         atomic_interface_threshold=atomic_interface_threshold,
         compute_residue_interfaces=compute_residue_interfaces,
+        allow_nonstandard_residues=allow_nonstandard_residues,
+        allow_mismatches=allow_mismatches,
+        use_assembly=use_assembly,
     )
 
 
@@ -120,6 +155,9 @@ def load_structure_from_rcsb(
     target_dir: str | Path | None = None,
     atomic_interface_threshold: float = 10.0,
     compute_residue_interfaces: bool = True,
+    allow_nonstandard_residues: bool = False,
+    allow_mismatches: bool = False,
+    use_assembly: bool = False,
 ) -> Structure:
     """
     Load the structure from RCSB PDB.
@@ -131,6 +169,8 @@ def load_structure_from_rcsb(
     target_dir : str | Path | None
         The directory to save the mmcif file to. If None, then the mmcif file
         will be downloaded to a temporary directory and then deleted after the structure is loaded.
+
+    See parse_structure_from_gemmi for more parameter details.
 
     Returns
     -------
@@ -148,6 +188,9 @@ def load_structure_from_rcsb(
             file_path,
             atomic_interface_threshold=atomic_interface_threshold,
             compute_residue_interfaces=compute_residue_interfaces,
+            allow_nonstandard_residues=allow_nonstandard_residues,
+            allow_mismatches=allow_mismatches,
+            use_assembly=use_assembly,
         )
         if target_dir is None:
             shutil.rmtree(cache_dir)
@@ -163,6 +206,8 @@ def load_structure_from_afdb(
     target_dir: str | Path | None = None,
     atomic_interface_threshold: float = 10.0,
     compute_residue_interfaces: bool = True,
+    allow_nonstandard_residues: bool = False,
+    allow_mismatches: bool = False,
 ) -> Structure:
     """
     Load the structure from AFDB.
@@ -174,6 +219,8 @@ def load_structure_from_afdb(
     target_dir : str | Path | None
         The directory to save the mmcif file to. If None, then the mmcif file
         will be downloaded to a temporary directory and then deleted after the structure is loaded.
+
+    See parse_structure_from_gemmi for more parameter details.
 
     Returns
     -------
@@ -191,6 +238,9 @@ def load_structure_from_afdb(
             file_path,
             atomic_interface_threshold=atomic_interface_threshold,
             compute_residue_interfaces=compute_residue_interfaces,
+            allow_nonstandard_residues=allow_nonstandard_residues,
+            allow_mismatches=allow_mismatches,
+            use_assembly=False,
         )
         if target_dir is None:
             shutil.rmtree(cache_dir)
@@ -209,9 +259,11 @@ def load_structure_from_afdb(
 def parse_chain_to_residues(
     chain: gemmi.ResidueSpan,
     ungapped_sequence: list[str],
-    ccd: dict[str, Mol],
     asym_id: int,
     chain_atom_start_idx: int,
+    allow_nonstandard_residues: bool = False,
+    allow_mismatches: bool = False,
+    use_assembly: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Parse a protein chain.
 
@@ -223,19 +275,29 @@ def parse_chain_to_residues(
         of the chain and should be ungapped. This sequence can come from the entity.full_sequence field
         (which comes from the _entity_poly_seq field in the mmCif); however, there is no requirement that this field
         be ungapped relative to the sequence that can be read from the _atom_site fields in the mmCif.
-    ccd : dict[str, Mol], a dictionary mapping residue names to the corresponding rdkit.Chem.rdchem.Mol molecule.
     asym_id: int, the asym_id of the chain.
     chain_atom_start_idx: int, the starting index of the atoms in the chain (includes all expected atoms, including
         unresolved atoms, based on residue identity).
+    allow_nonstandard_residues: bool, default False
+        Whether to allow nonstandard amino acids to be parsed. If True, then the residue will be parsed as UNK.
+        If False, then a chain that contains nonstandard amino acids will be skipped and a warning will be logged.
+    allow_mismatches: bool, default False
+        Whether to allow mismatches between the expected sequence and the observed sequence. If True, then the observed
+        residue will be present in the final structure, not the expected residue name as inferred from the sequence. This should
+        only be used when loading structures from the RCSB PDB, and should be used with caution. Mismatches are identified by using gemmi to
+        align the author specified sequence and the observed sequence (from the atoms). If the alignment is not perfect, then a mismatch will be raised.
+        Mismatches can arise from a couple of different sources:
+        - Experimental: there are point mutations or indels in the observed residues that are not the expected sequence.
+          (e.g. chain B from PDB 7SB7 has a deletion of LEU 205/auth 199)
+        - Alignment: Repetitive regions are difficult to align, so gemmi may assign the wrong residue to the wrong position in these cases.
+    use_assembly: bool, default False
+        Whether to use the assembly information in the mmCif file to load the structure.
 
     Returns
     -------
     list[Residue], one for each residue in the chain, including gaps. Residues that are
     expected but not present in the chain (gaps) will have a Residue object with all expected atoms,
     but all atoms will be set to is_present=False, bfactor=0, and coordinates=(0, 0, 0).
-
-    If the chain contains nonstandard amino acids that are not allowed by dynopsi, then the chain will
-    be skipped and a warning will be logged.
 
     Raises
     ------
@@ -289,7 +351,7 @@ def parse_chain_to_residues(
     prev_auth_res_idx = 0
     curr_atom_idx = chain_atom_start_idx
     for expect_idx, match in enumerate(result.match_string):
-        if match == "|":
+        if match == "|" or (match == "." and allow_mismatches):
             # get the author's residue index
             auth_res_idx = chain[obs_chain_idx].seqid.num
             if auth_res_idx is None:
@@ -334,33 +396,43 @@ def parse_chain_to_residues(
             observed_res = chain[obs_idx]
 
             if observed_res.name != expected_res_name:
-                raise ValueError(
-                    f"Alignment mismatch: Expected residue {expected_res_name} but got {observed_res.name} at expected sequence position {expect_idx}"
-                )
+                if not allow_mismatches:
+                    raise ValueError(
+                        f"Alignment mismatch: Expected residue {expected_res_name} but got {observed_res.name} at expected sequence position {expect_idx}"
+                    )
+
+            actual_res_name = observed_res.name
 
             is_present = True
 
         else:
             observed_res = None
             is_present = False
+            # we don't observe the residue, define the atoms with the expected residue name
+            actual_res_name = expected_res_name
 
         # possibly map MSE to MET
-        if expected_res_name == "MSE":
-            expected_res_name = "MET"
+        if actual_res_name == "MSE":
+            actual_res_name = "MET"
             is_standard = False
             is_allowed = True
         else:
-            is_standard = expected_res_name in constants.STANDARD_RESIDUES
-            is_allowed = expected_res_name in constants.STANDARD_RESIDUES
+            is_standard = actual_res_name in constants.STANDARD_RESIDUES
+            if allow_nonstandard_residues:
+                is_allowed = True
+                if not is_standard:
+                    actual_res_name = "UNK"
+            else:
+                is_allowed = is_standard
 
         if not is_allowed:
             logger.warning(
-                f"Chain contains nonstandard amino acid {expected_res_name} that is not allowed by dynopsi-v1. Skipping..."
+                f"Chain contains nonstandard amino acid {actual_res_name} that is not allowed by dynopsi-v1. Skipping..."
             )
             return np.empty(0, dtype=RESIDUES_DTYPE), np.empty(0, dtype=ATOMS_DTYPE)
 
         # parse the atoms
-        atoms = parse_residue_to_atoms(observed_res, expected_res_name, ccd, asym_id=asym_id, res_idx=expect_idx)
+        atoms = parse_residue_to_atoms(observed_res, actual_res_name, asym_id=asym_id, res_idx=expect_idx)
         # check if CA is present
         ca_present = any((atoms["atom_name"] == "CA") & atoms["is_present"])
         # check if all backbone atoms are present
@@ -372,8 +444,8 @@ def parse_chain_to_residues(
         residue = np.array(
             [
                 (
-                    expected_res_name,  # res_name
-                    constants.TOKEN_IDS[expected_res_name],  # res_type
+                    actual_res_name,  # res_name
+                    constants.TOKEN_IDS[actual_res_name],  # res_type
                     asym_id,  # asym_id
                     expect_idx,  # res_idx
                     auth_res_idx,  # auth_res_idx
@@ -398,7 +470,7 @@ def parse_chain_to_residues(
 
 
 def parse_residue_to_atoms(
-    observed_residue: gemmi.Residue | None, residue_name: str, ccd: dict[str, Mol], asym_id: int, res_idx: int
+    observed_residue: gemmi.Residue | None, residue_name: str, asym_id: int, res_idx: int
 ) -> np.ndarray:
     """
     Parse a residue to atoms.
@@ -407,13 +479,12 @@ def parse_residue_to_atoms(
     ----------
     observed_residue: gemmi.Residue | None, the residue to parse. None if the residue is not present and should be treated as a gap.
         residue_name: str, the name of the residue.
-    ccd : dict[str, Mol], a dictionary mapping residue names to the corresponding rdkit.Chem.rdchem.Mol molecule.
     asym_id: int, the asym_id of the chain.
 
     Returns
     -------
     list[Atom], the atoms in the residue. Will include all expected atoms.
-    Expected atoms will be ordered as they appear in the CCD entry.
+    Expected atoms will be ordered as they appear in constants.REF_ATOM_NAMES[residue_name].
     If an atom is not present in the residue:
     - coordinates will be set to (0, 0, 0)
     - is_present will be set to False
@@ -421,16 +492,11 @@ def parse_residue_to_atoms(
 
     Raises
     ------
-    ValueError: if the CCD entry is not found for the residue.
+    ValueError: if the residue name is not in constants.REF_ATOM_NAMES.
     """
-    # use the ccd name to find the expected atoms (in order)
-    mol = ccd.get(residue_name)
-    if mol is None:
-        raise ValueError(f"No CCD entry found for residue {residue_name}")
-
-    mol = Chem.RemoveHs(mol, sanitize=False)
-
     # define the expected atoms and the order in which they should appear
+    if residue_name not in constants.REF_ATOM_NAMES:
+        raise ValueError(f"Residue {residue_name} is not in constants.REF_ATOM_NAMES")
     expected_atoms = constants.REF_ATOM_NAMES[residue_name]
 
     if observed_residue is None:
@@ -440,8 +506,10 @@ def parse_residue_to_atoms(
         observed_atoms = {a.name.upper(): a for a in observed_residue}
         # possibly map MSE to MET
         if observed_residue.name == "MSE":
-            observed_atoms["SD"] = observed_atoms["SE"]
-            observed_atoms.pop("SE")
+            # it's possible that SE is not present, so check for it
+            if "SE" in observed_atoms.keys():
+                observed_atoms["SD"] = observed_atoms["SE"]
+                observed_atoms.pop("SE")
 
     atoms: list[np.ndarray] = []
     for expect_atom in expected_atoms:
@@ -534,8 +602,8 @@ def find_chain_interfaces(
 
             # get the atom to residue map for each chain, which is len(atoms) long per chain
             # with values being the residue index for that atom
-            residue_1 = residues[chain_1["res_start_idx"] : (chain_1["res_start_idx"] + chain_1["num_residues"])]
-            residue_2 = residues[chain_2["res_start_idx"] : (chain_2["res_start_idx"] + chain_2["num_residues"])]
+            residue_1 = Structure.residues_for_chain(residues, chain_1)
+            residue_2 = Structure.residues_for_chain(residues, chain_2)
             atom_to_residue_1 = np.repeat(np.arange(len(residue_1)), residue_1["num_atoms"])
             atom_to_residue_2 = np.repeat(np.arange(len(residue_2)), residue_2["num_atoms"])
 
@@ -605,7 +673,10 @@ def find_chain_interfaces(
 
 
 def parse_structure_from_gemmi(
-    structure: gemmi.Structure, ccd: dict[str, Mol]
+    structure: gemmi.Structure,
+    allow_nonstandard_residues: bool = False,
+    allow_mismatches: bool = False,
+    use_assembly: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Parse a gemmi.Structure object, clean it up, infer missing residues, and return a list of Chain objects.
@@ -614,15 +685,31 @@ def parse_structure_from_gemmi(
     ----------
     structure : gemmi.Structure
         The structure to parse.
-    ccd : dict[str, Mol]
-        A dictionary mapping residue names to the corresponding rdkit.Chem.rdchem.Mol molecule.
+    allow_nonstandard_residues: bool = False, whether to allow nonstandard residues to be parsed.
+    allow_mismatches: bool = False, whether to allow mismatches between the expected sequence and the observed sequence.
+    use_assembly: bool = True, whether to use the assembly information to parse the structure. If True, then the structure will be transformed to the assembly 1. This means
+       that chain_id and auth_chain_id will be the same across assemblies, and asym_id will preserve the differences.
+
+    Returns
+    -------
+    chains: np.ndarray of CHAINS_DTYPE, shape (n_chains, )
+    residues: np.ndarray of RESIDUES_DTYPE, shape (n_residues, )
+    atoms: np.ndarray of ATOMS_DTYPE, shape (n_atoms, )
     """
+    _reject_insertion_codes(structure)
+
     # Clean up the structure
     structure.merge_chain_parts()
     structure.remove_waters()
     structure.remove_hydrogens()
     structure.remove_alternative_conformations()
     structure.remove_empty_chains()
+
+    # Expand assembly 1
+    if use_assembly and structure.assemblies:
+        how = gemmi.HowToNameCopiedChain.AddNumber
+        assembly_name = structure.assemblies[0].name
+        structure.transform_to_assembly(assembly_name, how=how)
 
     # Parse by entities and their subchains to get asym_id, entity_id, and sym_id
     # Track the asym_ids to avoid collisions
@@ -639,10 +726,14 @@ def parse_structure_from_gemmi(
         for sym_id, subchain_id in enumerate(entity.subchains):
             # Parse the asym_id from the subchain_id
             asym_id = get_asym_id_from_chain_id(subchain_id)
+            if asym_id == -1:
+                logger.warning(
+                    f"Unexpected author chain id {subchain_id}, parsed to -1. Do not use author chain ids for dyno-psi inputs."
+                )
             # check for collisions
             # just raise a warning if there is a collision and assign the next available asym_id
             used_asym_ids = [c.asym_id for c in chain_id_to_chain_info.values()]
-            if asym_id in used_asym_ids:
+            if asym_id in used_asym_ids or asym_id == -1:
                 unused_asym_id = max(used_asym_ids) + 1
                 logger.warning(
                     f"Chain id {subchain_id} --> asym_id {asym_id} is already in use. Assigning {unused_asym_id} instead."
@@ -664,6 +755,8 @@ def parse_structure_from_gemmi(
     chains_lst: list[np.ndarray] = []
     residues_lst: list[np.ndarray] = []
     atoms_lst: list[np.ndarray] = []
+    used_auth_asym_ids: set[int] = set()
+    auth_name_to_asym_id: dict[str, int] = {}
     for auth_chain in structure[0]:
         for raw_chain in auth_chain.subchains():
             if raw_chain.subchain_id() in chain_id_to_chain_info.keys():
@@ -671,9 +764,10 @@ def parse_structure_from_gemmi(
                 parsed_residues, parsed_atoms = parse_chain_to_residues(
                     raw_chain,
                     old_chain.ungapped_sequence,
-                    ccd,
                     asym_id=old_chain.asym_id,
                     chain_atom_start_idx=curr_atom_idx,
+                    allow_nonstandard_residues=allow_nonstandard_residues,
+                    allow_mismatches=allow_mismatches,
                 )
                 if len(parsed_residues) == 0:
                     logger.warning(f"Chain {old_chain.name} failed to parse any residues. Skipping...")
@@ -681,13 +775,18 @@ def parse_structure_from_gemmi(
 
                 chain_num_atoms = len(parsed_atoms)
                 chain_num_residues = len(parsed_residues)
+                auth_name = checked_auth_chain_id(auth_chain.name)
+                if auth_name not in auth_name_to_asym_id:
+                    auth_name_to_asym_id[auth_name] = assign_auth_asym_id(auth_name, used_auth_asym_ids)
+                    used_auth_asym_ids.add(auth_name_to_asym_id[auth_name])
+                auth_asym_id = auth_name_to_asym_id[auth_name]
                 new_chain = np.array(
                     [
                         (
                             old_chain.name,  # chain_id
-                            auth_chain.name,  # auth_chain_id
+                            auth_name,  # auth_chain_id
                             old_chain.asym_id,  # asym_id
-                            get_asym_id_from_chain_id(auth_chain.name),  # auth_asym_id
+                            auth_asym_id,
                             old_chain.entity_id,  # entity_id
                             old_chain.sym_id,  # sym_id
                             curr_atom_idx,  # atom_start_idx
@@ -710,9 +809,11 @@ def parse_structure_from_gemmi(
 
 def parse_mmcif(
     path: Path | str,
-    ccd: dict[str, Mol],
     compute_residue_interfaces: bool = True,
     atomic_interface_threshold: float = 10.0,
+    allow_nonstandard_residues: bool = False,
+    allow_mismatches: bool = False,
+    use_assembly: bool = False,
 ) -> Structure:
     """
     Parse a mmcif file and return a list of Chain objects.
@@ -721,7 +822,8 @@ def parse_mmcif(
     ----------
     path : str
         The path to the mmcif file.
-    ccd : dict[str, Mol], a dictionary mapping residue names to the corresponding rdkit.Chem.rdchem.Mol molecule.
+
+    See parse_structure_from_gemmi for more parameter details.
 
     Returns
     -------
@@ -736,7 +838,12 @@ def parse_mmcif(
     # Load structure object
     structure = gemmi.make_structure_from_block(block)
 
-    chains, residues, atoms = parse_structure_from_gemmi(structure, ccd)
+    chains, residues, atoms = parse_structure_from_gemmi(
+        structure,
+        allow_nonstandard_residues=allow_nonstandard_residues,
+        allow_mismatches=allow_mismatches,
+        use_assembly=use_assembly,
+    )
     chain_interfaces, residue_interfaces = find_chain_interfaces(
         atoms,
         residues,
@@ -755,19 +862,26 @@ def parse_mmcif(
     )
 
 
-def pdb_to_gemmi_structure(path: Path | str, chain_id_to_sequence: dict[str, str] | None = None) -> gemmi.Structure:
+def pdb_to_gemmi_structure(
+    path: Path | str,
+    chain_id_to_sequence: dict[str, str] | None = None,
+    allow_mismatches: bool = False,
+) -> gemmi.Structure:
     """
     Parse a pdb file, potentially update residue indexes and entity information, and return a gemmi.Structure object.
 
     Parameters
     ----------
     path : str
-        The path to the mmcif file.
+        The path to the PDB file.
     chain_id_to_sequence: dict[str, str] | None
         A dictionary mapping chain ids to sequences. These sequences should be ungapped.
         If provided, then chains with the same sequence will be assigned to the same entity. It is recommended that
         you check the cif output file to ensure that the sequences and positions are correct if you provide this argument.
         If None, then the sequences will be inferred from the residues and each chain will be assigned a separate entity.
+    allow_mismatches : bool
+        When True, a chain whose observed sequence does not match ``chain_id_to_sequence`` is kept.
+        A chain absent from that map keeps the sequence observed in the file. When False, the mismatch raises.
 
     Returns
     -------
@@ -775,8 +889,9 @@ def pdb_to_gemmi_structure(path: Path | str, chain_id_to_sequence: dict[str, str
 
     Raises
     ------
-    - ValueError: If the chain_id_to_sequence is provided and there is a mismatch between the expected chain ID and
-    the actual chain ID mapped to the sequence.
+    ValueError
+        If ``chain_id_to_sequence`` is set, ``allow_mismatches`` is False, and a chain does not match
+        the sequence it was assigned.
     """
     with smart_open.open(path, "r") as io:
         structure = gemmi.read_pdb_string(io.read())
@@ -794,9 +909,9 @@ def pdb_to_gemmi_structure(path: Path | str, chain_id_to_sequence: dict[str, str
         structure.setup_entities()
         structure.assign_subchains()
         # third, create a map of sequence to chain ids
-        sequence_to_chain_id: dict[str, list[str]] = defaultdict(list)
+        sequence_to_chain_id: dict[str, list[str]] = {}
         for chain_id, sequence in chain_id_to_sequence.items():
-            sequence_to_chain_id[sequence].append(chain_id)
+            sequence_to_chain_id.setdefault(sequence, []).append(chain_id)
 
     # assign _label_seq_id to each residue in each chain
     # these are integers that start at 1 and increment by 1 for each residue in the chain
@@ -825,6 +940,35 @@ def pdb_to_gemmi_structure(path: Path | str, chain_id_to_sequence: dict[str, str
     for chain in structure[0]:
         for i, subchain in enumerate(chain.subchains()):
             subchain_id_to_renamed_subchain_id[subchain.subchain_id()] = f"{chain.name}"
+
+    if chain_id_to_sequence is not None:
+        resolved_sequence_by_entity: dict[gemmi.Entity, str] = {}
+        for subchain in structure[0].subchains():
+            entity = subchain_id_to_entity[subchain.subchain_id()]
+            new_subchain_id = subchain_id_to_renamed_subchain_id[subchain.subchain_id()]
+            entity_sequence = "".join(constants.AA_THREE_TO_ONE_MAP[residue] for residue in entity.full_sequence)
+            expected_chain_ids = sequence_to_chain_id.get(entity_sequence, [])
+            resolved_sequence = entity_sequence
+            if new_subchain_id not in expected_chain_ids:
+                if not allow_mismatches:
+                    raise ValueError(
+                        f"Chain {new_subchain_id} does not match expected chain ids {expected_chain_ids} "
+                        f"for sequence {entity_sequence}"
+                    )
+                resolved_sequence = chain_id_to_sequence.get(new_subchain_id, subchain.make_one_letter_sequence())
+
+            prior_sequence = resolved_sequence_by_entity.setdefault(entity, resolved_sequence)
+            if prior_sequence != resolved_sequence:
+                raise ValueError(
+                    f"Chains assigned to entity {entity.name} resolve to different sequences "
+                    f"({prior_sequence} and {resolved_sequence}); they cannot share an entity."
+                )
+
+        for entity, sequence in resolved_sequence_by_entity.items():
+            entity.full_sequence = [
+                constants.AA_ONE_TO_THREE_MAP[residue] if residue != "-" else "UNK" for residue in sequence
+            ]
+
     for subchain in structure[0].subchains():
         # update the entity with full sequence information
         entity = subchain_id_to_entity[subchain.subchain_id()]
@@ -839,15 +983,6 @@ def pdb_to_gemmi_structure(path: Path | str, chain_id_to_sequence: dict[str, str
                 for resi_one_letter in list(full_seq)
             ]
             entity.full_sequence = full_seq_triplet
-        else:
-            # check that the subchain_id matches the expected chain id
-            full_seq_as_str = "".join([constants.AA_THREE_TO_ONE_MAP[resi] for resi in entity.full_sequence])
-            expected_chain_ids = sequence_to_chain_id[full_seq_as_str]
-
-            if new_subchain_id not in expected_chain_ids:
-                raise ValueError(
-                    f"Chain {new_subchain_id} does not match expected chain ids {expected_chain_ids} for sequence {full_seq_as_str}"
-                )
 
         # redefine subchain names for each residue
         for resi in subchain:
@@ -862,40 +997,57 @@ def pdb_to_gemmi_structure(path: Path | str, chain_id_to_sequence: dict[str, str
 
 def parse_pdb(
     path: Path | str,
-    ccd: dict[str, Mol],
     chain_id_to_sequence: dict[str, str] | None = None,
     compute_residue_interfaces: bool = True,
     atomic_interface_threshold: float = 10.0,
+    allow_nonstandard_residues: bool = False,
+    allow_mismatches: bool = False,
+    use_assembly: bool = False,
 ) -> Structure:
     """
-    Parse a pdb file and return a list of Chain objects.
+    Parse a PDB file and return a Structure.
 
     Parameters
     ----------
     path : str
-        The path to the mmcif file.
-    ccd : dict[str, Mol], a dictionary mapping residue names to the corresponding rdkit.Chem.rdchem.Mol molecule.
+        The path to the PDB file.
     chain_id_to_sequence: dict[str, str] | None
         A dictionary mapping chain ids to sequences. These sequences should be ungapped.
         If provided, then chains with the same sequence will be assigned to the same entity. It is recommended that
         you check the cif output file to ensure that the sequences and positions are correct if you provide this argument.
         If None, then the sequences will be inferred from the residues and each chain will be assigned a separate entity.
+    allow_mismatches : bool
+        When True, a chain whose observed sequence does not match ``chain_id_to_sequence`` is kept.
+        A chain absent from that map keeps the sequence observed in the file. When False, the mismatch raises.
+
+    See parse_structure_from_gemmi for more parameter details.
 
     Returns
     -------
-    list[Chain], the parsed chains that were successfully parsed.
+    Structure
+        The parsed structure.
 
     Raises
     ------
-    - ValueError: If the chain_id_to_sequence is provided and there is a mismatch between the expected chain ID and
-    the actual chain ID mapped to the sequence.
+    ValueError
+        If ``chain_id_to_sequence`` is set, ``allow_mismatches`` is False, and a chain does not match
+        the sequence it was assigned.
 
     NOTE: asym_id(s) are assigned based on the chain_id. See get_asym_id_from_chain_id for more details. If there
     is a collision, the asym_id is assigned to the max(used_asym_ids) + 1.
     """
-    structure = pdb_to_gemmi_structure(path=path, chain_id_to_sequence=chain_id_to_sequence)
+    structure = pdb_to_gemmi_structure(
+        path=path,
+        chain_id_to_sequence=chain_id_to_sequence,
+        allow_mismatches=allow_mismatches,
+    )
 
-    chains, residues, atoms = parse_structure_from_gemmi(structure, ccd)
+    chains, residues, atoms = parse_structure_from_gemmi(
+        structure,
+        allow_nonstandard_residues=allow_nonstandard_residues,
+        allow_mismatches=allow_mismatches,
+        use_assembly=use_assembly,
+    )
     chain_interfaces, residue_interfaces = find_chain_interfaces(
         atoms,
         residues,
@@ -978,7 +1130,7 @@ def download_mmcif_from_rcsb(record_id: str, target_dir: str | Path) -> Path:
 
     response = requests.get(url)
     if response.status_code != 200:
-        print(response.text)
+        logger.error("RCSB download failed for %s: %s", record_id, response.text)
         raise ValueError(f"Failed to download structure {record_id} from PDB. Status code: {response.status_code}")
     with open(file_path, "w") as f:
         f.write(response.text)
@@ -1039,7 +1191,9 @@ def download_mmcif_from_afdb(uniprot_id: str, target_dir: str | Path) -> Path:
 ################################
 
 
-def save_structures_to_file(structures: list[Structure], path: Path | str) -> None:
+def save_structures_to_file(
+    structures: list[Structure], path: Path | str, primary_residue_index_key: Literal["res_idx", "auth_res_idx"]
+) -> None:
     """Save a structure to a file using gemmi
 
     Parameters
@@ -1048,39 +1202,42 @@ def save_structures_to_file(structures: list[Structure], path: Path | str) -> No
     path: Path
         The path to save the structure to. It must end in .cif or .pdb and the output
         file type will be inferred from the extension.
+    primary_residue_index_key: Literal["res_idx", "auth_res_idx"]
+        Which residue index scheme to report in the output file.
+        `res_idx` corresponds to chains starting at index 1
+        `auth_res_idx` corresponds to the arbitrary author residue index. Note there are
+        no guarantees on ordering here, so this is generally not recommended.
     """
     # fail if output file is not a cif or pdb file
-    if str(path).lower().endswith(".cif"):
+    if str(path).lower().endswith(".cif") or str(path).lower().endswith(".mmcif"):
         output_file_type = "cif"
     elif str(path).lower().endswith(".pdb"):
         output_file_type = "pdb"
     else:
-        raise ValueError(f"Output file must end in .cif or .pdb, got {path}")
+        raise ValueError(f"Output file must end in .cif, .mmcif, or .pdb, got {path}")
+
+    if output_file_type == "pdb":
+        enforce_pdb_write_policy(structures, primary_residue_index_key)
 
     gemmi_structure = gemmi.Structure()
     gemmi_structure.name = "model"
+    if structures:
+        for record in polymer_entities(structures[0]):
+            entity = gemmi.Entity(str(record.entity_id))
+            entity.entity_type = gemmi.EntityType.Polymer
+            entity.polymer_type = gemmi.PolymerType.PeptideL
+            entity.subchains = list(record.subchains)
+            entity.full_sequence = list(record.full_sequence)
+            gemmi_structure.entities.append(entity)
+
     for struct_idx, structure in enumerate(structures):
         model = gemmi.Model(struct_idx + 1)
 
-        entity_id_to_entity: dict[int, gemmi.Entity] = {}
-        for entity_id in structure.chains["entity_id"]:
-            if entity_id not in entity_id_to_entity:
-                new_entity = gemmi.Entity(str(entity_id))
-                new_entity.entity_type = gemmi.EntityType.Polymer
-                new_entity.polymer_type = gemmi.PolymerType.PeptideL
-
-                entity_id_to_entity[entity_id] = new_entity
-
-                gemmi_structure.entities.append(new_entity)
-
-        chain_sequences: dict[str, list[str]] = defaultdict(list)
         for chain in structure.chains:
             gemmi_chain = gemmi.Chain(chain["auth_chain_id"])
-            residues = structure.residues[chain["res_start_idx"] : (chain["res_start_idx"] + chain["num_residues"])]
-            chain_sequence: list[str] = []
+            residues = structure.chain_residues(chain)
 
             for residue in residues:
-                chain_sequence.append(residue["res_name"])
                 # if the residue is not present, skip the record/atom records
                 if not residue["is_present"]:
                     continue
@@ -1092,7 +1249,7 @@ def save_structures_to_file(structures: list[Structure], path: Path | str) -> No
                 gemmi_res.entity_type = gemmi.EntityType.Polymer
 
                 gemmi_res.name = residue["res_name"]
-                gemmi_res.seqid = gemmi.SeqId(residue["auth_res_idx"], " ")
+                gemmi_res.seqid = gemmi.SeqId(residue[primary_residue_index_key], " ")
                 gemmi_res.label_seq = res_idx + 1
                 gemmi_res.subchain = chain["chain_id"]
 
@@ -1112,31 +1269,11 @@ def save_structures_to_file(structures: list[Structure], path: Path | str) -> No
                 gemmi_chain.add_residue(gemmi_res)
 
             model.add_chain(gemmi_chain)
-            chain_sequences[chain["chain_id"]] = chain_sequence
 
         gemmi_structure.add_model(model)
-
-        # update the entities with the full sequences
-        for entity in gemmi_structure.entities:
-            entity_id = int(entity.name)
-            chain_ids = structure.chains[structure.chains["entity_id"] == entity_id]["chain_id"]
-            if len(chain_ids) > 1:
-                # check that the sequences are the same
-                sequences = [chain_sequences[chain_id] for chain_id in chain_ids]
-                if not all(sequence == sequences[0] for sequence in sequences):
-                    logger.warning(f"Chains {chain_ids} have different sequences, but the same entity id {entity_id}")
-            else:
-                chain_id = chain_ids[0]
-                sequence = chain_sequences[chain_id]
-                entity.full_sequence = sequence
 
     if output_file_type == "cif":
         doc = gemmi_structure.make_mmcif_document()
         doc.write_file(str(path))
     else:
         gemmi_structure.write_pdb(str(path))
-
-
-def save_structures_to_gif(structures: list[Structure], path: Path | str) -> None:
-    """Save structures as a GIF."""
-    pass

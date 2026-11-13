@@ -3,11 +3,12 @@ from typing import Literal
 
 from pydantic import Field
 
-from dynopsi.data.featurization import Features
+from dynopsi.data.featurization.base import Features
 from dynopsi.model.model_config import DynoPsiModelConfig
 from dynopsi.simulation.build_initial_state import InitializeFeatures, InitializeState, InitializeStepType
 from dynopsi.simulation.observable import ObservableOutputConfig
 from dynopsi.simulation.ops import Infer, ODEStepUpdate, Op
+from dynopsi.simulation.ops.infer import SelfConditioningMode
 from dynopsi.simulation.simulation import Simulation
 from dynopsi.simulation.simulation_pipeline.registry import register_simulation_pipeline
 from dynopsi.simulation.time_sampler import TimeSamplerType
@@ -22,8 +23,10 @@ class ODESimulation(Simulation):
     name: str
     inference_model_config: DynoPsiModelConfig
     time_sampler: TimeSamplerType
+    self_conditioning_mode: SelfConditioningMode = "same_timestep"
     clear_states_each_step: bool = True
     validate_before_run: bool = True
+    prior_seed: int | None = None
     observable_output_configs: dict[str, ObservableOutputConfig] = {
         "X_T": ObservableOutputConfig(state_type="clean_data_coords", outputs={"final": ("pdb", "npz")})
     }
@@ -37,6 +40,9 @@ class ODESimulation(Simulation):
     plan_init: list[InitializeStepType] = Field(default_factory=list)
     plan: list[Op] = Field(default_factory=list)
 
+    def declared_categorical_keys(self) -> set[str]:
+        return self.inference_model_config.declared_categorical_keys()
+
     def validate_configuration(self, features_input: dict[str, Features]) -> None:
         """Validate the configuration of the simulation pipeline."""
         self._validate(features_input)
@@ -44,9 +50,11 @@ class ODESimulation(Simulation):
     def ensure_observable_output_config_features_keys(self) -> None:
         """Set features_key on configs so save can resolve reference features."""
         for config in self.observable_output_configs.values():
-            config.set_features_key(self._input_features_key)
+            config.add_features_key(self._input_features_key)
+        for config in self.intermediate_observables.values():
+            config.add_features_key(self._input_features_key)
 
-    def model_post_init(self, __context: typing.Any) -> None:
+    def _rebuild_plan(self) -> None:
         input_features_key = self._input_features_key
         batch_features_key = self._batch_features_key
         state_key = self._state_key
@@ -64,6 +72,7 @@ class ODESimulation(Simulation):
                 inference_model_config=self.inference_model_config,
                 in_feat_loc_store=batch_features_key,
                 out_loc_store=state_key,
+                seed=self.prior_seed,
             ),
         ]
         self.plan = [
@@ -74,6 +83,7 @@ class ODESimulation(Simulation):
                 in_feat_loc_store=batch_features_key,
                 out_loc_store=cvf_key,
                 valid_steps=valid_steps,
+                self_conditioning_mode=self.self_conditioning_mode,
             ),
             ODEStepUpdate(
                 name="X_T_step_update",
@@ -89,3 +99,11 @@ class ODESimulation(Simulation):
             self.observable_output_configs["X_T"] = ObservableOutputConfig(
                 state_type="clean_data_coords", outputs={"final": ("pdb", "npz")}
             )
+
+        for config in self.observable_output_configs.values():
+            config.add_features_key(input_features_key)
+        super()._rebuild_plan()
+
+    def model_post_init(self, __context: typing.Any) -> None:
+        super().model_post_init(__context)
+        self._rebuild_plan()

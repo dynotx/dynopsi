@@ -19,6 +19,13 @@ Source: https://github.com/NVIDIA-Digital-Bio/la-proteina
 
 Portions of this software are derived from La Proteina.
 -----------------------
+Flash IPA
+Copyright (c) 2025 anonymous
+License: [MIT] — see LICENSES/FLASH_IPA
+Source: https://github.com/flagshippioneering/flash_ipa
+
+Portions of this software are derived from Flash IPA.
+-----------------------
 Multiflow
 Copyright (c) 2024 Andrew Campbell, Jason Yim
 License: [MIT] — see LICENSES/MULTIFLOW

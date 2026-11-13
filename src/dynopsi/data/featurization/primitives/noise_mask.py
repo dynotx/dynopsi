@@ -3,7 +3,7 @@ from typing import Literal
 
 import torch
 
-from dynopsi.data.constants import DesignTask
+from dynopsi.data.constants import DesignTask, InpaintFeature
 from dynopsi.data.featurization.base import Features, Featurizer
 from dynopsi.data.featurization.registry import register_featurizer
 from dynopsi.data.utils import ChainResidueRepr
@@ -36,8 +36,7 @@ class NoiseMaskFeaturizer(Featurizer):
     Notes
     -----
     The mapping from inpaint feature to noise behavior is defined per design
-    task; see `dynopsi.data.constants` for more. Currently, we support only one design task:
-    - DesignTask.MULTIMER_BINDER_DESIGN: noise the full binder chain, do not noise the target chain.
+    task; see `dynopsi.data.constants` for more.
     """
 
     type: Literal["noise_mask"] = "noise_mask"
@@ -84,20 +83,28 @@ class NoiseMaskFeaturizer(Featurizer):
                 noised_mask[set_mask] = noise_bool
             new_feats["noised_mask"] = noised_mask
 
-            # perform metadata updates for feature steps and input reference structure
-            self._update_features_metadata(new_feats)
-
-            # crop the reference structure to be just the non-noised positions
+            more_metadata = {}
+            # crop the reference structure to be just the context positions
             if new_feats.input_reference_structure is not None:
-                non_noised_repr = ChainResidueRepr.from_asym_id_mask(
-                    ~new_feats["noised_mask"].bool()
-                    & new_feats["token_pad_mask"].bool()
-                    & new_feats["frame_resolved_mask"].bool(),
-                    new_feats["asym_id"],
+                context_mask = torch.isin(
+                    new_feats["inpaint_feature"],
+                    torch.tensor([InpaintFeature.BINDER_CONTEXT, InpaintFeature.TARGET_CONTEXT]),
                 )
+                context_repr = ChainResidueRepr.from_asym_id_mask(
+                    context_mask & new_feats["token_pad_mask"].bool(),
+                    asym_id=new_feats["asym_id"],
+                    residue_index=new_feats["residue_index"],
+                    index_type="residue_index",
+                )
+                # the feature dictionary doesn't change, so the residue index must be preserved
                 structure = new_feats.input_reference_structure.crop(
-                    residue_index_chain_spec=non_noised_repr, index_type="residue_index"
+                    residue_index_chain_spec=context_repr, index_type="residue_index", reset_residue_index=False
                 )
                 new_feats.input_reference_structure = structure
+                if self.verbose_metadata:
+                    more_metadata["structure"] = structure
+
+            # perform metadata updates for feature steps and input reference structure
+            self._update_features_metadata(new_feats, more_metadata=more_metadata)
 
             yield new_feats

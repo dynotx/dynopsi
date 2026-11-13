@@ -154,7 +154,14 @@ class LayerNorm(torch.nn.Module):
         self.bias = torch.nn.Parameter(torch.zeros(c_in))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch.nn.functional.layer_norm(x, self.c_in, self.weight, self.bias, self.eps)
+        d = x.dtype
+        if d is torch.bfloat16:
+            with torch.cuda.amp.autocast(enabled=False):
+                out = torch.nn.functional.layer_norm(
+                    x, self.c_in, self.weight.to(dtype=d), self.bias.to(dtype=d), self.eps
+                )
+        else:
+            out = torch.nn.functional.layer_norm(x, self.c_in, self.weight, self.bias, self.eps)
         return out
 
 

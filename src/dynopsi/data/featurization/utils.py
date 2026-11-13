@@ -3,8 +3,15 @@ import logging
 import torch
 from torch.nn.functional import one_hot, pad
 
-from dynopsi.data.constants import TOKEN_IDS, TOKENS, AtomFilter, InpaintFeature, PocketFeature
+from dynopsi.data.auth_chain_identity import (
+    OPAQUE_AUTH_ASYM_ID_START,
+    merge_auth_chain_id_tables,
+    remap_auth_chain_id_table,
+)
+from dynopsi.data.conditioning import CATEGORICAL_CONDITIONS
+from dynopsi.data.constants import AminoAcidSequenceFeature, AtomFilter, InpaintFeature, PocketFeature
 from dynopsi.data.utils import add_oxygen_coords
+from dynopsi.data.utils.sequence_utils import update_ids
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +45,8 @@ TOKEN_KEYS_FLAT = [
     "inpaint_feature",
     "binder_mask",
     "target_mask",
+    "secondary_structure_feature",
+    *(condition.key for condition in CATEGORICAL_CONDITIONS),
 ]
 TOKEN_TO_ATOM_KEYS = ["frames_idx"]  # [n_tokens, frame_or_atom_idx_in_token]
 ATOM_TO_TOKEN_KEYS = ["atom_to_token"]  # [n_atoms, n_tokens]
@@ -155,14 +164,10 @@ def make_empty_chain(
     pocket_feature: int = PocketFeature.UNSPECIFIED,
     inpaint_feature: int = InpaintFeature.BINDER_INPAINT,
     coords_center_of_mass: tuple[float, float, float] | torch.Tensor | None = None,
-    original_residue_index: int | None = None,
     device: torch.device | None = None,
     keys_include: list[str] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Create a full mock feature dictionary for a single chain.
-
-    Generates a complete feature dictionary mimicking the structure of a
-    dataset example.
+    """Feature tensors for one chain.
 
     Parameters
     ----------
@@ -179,15 +184,13 @@ def make_empty_chain(
     entity_id : int, optional
         The entity_id of the example. default is 0.
     sym_id : int, optional
-        The number of atoms per residue.
+        The symmetry identifier for the chain. default is 0.
     pocket_feature : PocketFeature, optional
         The pocket feature for the chain. default is PocketFeature.UNSPECIFIED.
     inpaint_feature : InpaintFeature, optional
         The inpaint feature for the chain. default is InpaintFeature.BINDER_INPAINT.
     coords_center_of_mass : tuple[float, float, float] | torch.Tensor | None, optional
         The center of mass for atom coordinates in the example. If None, random coordinates are generated.
-    original_residue_index : int | None, optional
-        Starting residue index. If None, indices start from 0.
     device : torch.device | None, optional
         The device to place the tensors on.
     keys_include : list[str] | None, optional
@@ -203,7 +206,6 @@ def make_empty_chain(
     ValueError
         If `atoms_to_include` is not backbone-only of Ca-only.
     """
-    # for now, don't support AtomFilter.FULL
     if atoms_to_include == AtomFilter.FULL:
         raise ValueError("AtomFilter.FULL is not supported for make_empty_chain")
 
@@ -234,7 +236,7 @@ def make_empty_chain(
         "token_resolved_mask": torch.ones(seq_length, dtype=torch.float32),
         "frame_resolved_mask": torch.ones(seq_length, dtype=torch.bool),
         # Sequence token-level features
-        "res_type": torch.full((seq_length,), TOKEN_IDS[res_type], dtype=torch.long),
+        "res_type": torch.full((seq_length,), AminoAcidSequenceFeature.from_resname(res_type).value, dtype=torch.long),
         # Model-specific features
         "pocket_feature": torch.full((seq_length,), pocket_feature, dtype=torch.long),
         "noised_mask": torch.ones(seq_length, dtype=torch.bool),
@@ -253,13 +255,87 @@ def make_empty_chain(
         "target_mask": torch.full((seq_length,), not is_binder, dtype=torch.bool),
     }
 
-    example["res_encode"] = one_hot(example["res_type"], num_classes=len(TOKENS))
+    example["res_encode"] = one_hot(example["res_type"], num_classes=len(AminoAcidSequenceFeature))
 
     if keys_include:
         example = {k: example[k] for k in keys_include}
     if device is not None:
         example = {k: v.to(device) for k, v in example.items()}
     return example
+
+
+_LETTER_CHAIN_ID_LIMIT = 26
+
+
+def _unique_chain_ids(values: torch.Tensor) -> list[int]:
+    return [int(chain_id) for chain_id in values.unique().tolist()]
+
+
+def _assign_noncolliding_chain_ids(
+    colliding_ids: list[int],
+    reserved_ids: set[int],
+    *,
+    start: int,
+    limit: int | None = None,
+) -> dict[int, int]:
+    assigned_ids: dict[int, int] = {}
+    reserved_ids = set(reserved_ids)
+    candidate = start
+    for old_id in colliding_ids:
+        if old_id in assigned_ids:
+            continue
+        while candidate in reserved_ids:
+            candidate += 1
+        if limit is not None and candidate >= limit:
+            raise ValueError(f"Not enough unique label chain ids in 0-{limit - 1}")
+        assigned_ids[old_id] = candidate
+        reserved_ids.add(candidate)
+        candidate += 1
+    return assigned_ids
+
+
+def _remap_colliding_chain_ids(
+    features: list[dict[str, torch.Tensor]],
+    auth_chain_id_tables: list[dict[int, str]] | None = None,
+) -> None:
+    """Mutate cloned ``features`` in place; optional parallel table copies are remapped too."""
+    if auth_chain_id_tables is not None and len(auth_chain_id_tables) != len(features):
+        raise ValueError("auth_chain_id_tables must have one table per concatenated feature dict")
+    used_label_ids = set(_unique_chain_ids(features[0]["asym_id"]))
+    used_auth_ids = set(_unique_chain_ids(features[0]["auth_asym_id"]))
+    for feat_i, feat in enumerate(features[1:], start=1):
+        feat_asym_ids = _unique_chain_ids(feat["asym_id"])
+        feat_auth_ids = _unique_chain_ids(feat["auth_asym_id"])
+        colliding_asym_ids = [asym_id for asym_id in feat_asym_ids if asym_id in used_label_ids]
+        colliding_auth_ids = [auth_asym_id for auth_asym_id in feat_auth_ids if auth_asym_id in used_auth_ids]
+        assigned_label_ids = _assign_noncolliding_chain_ids(
+            colliding_ids=colliding_asym_ids,
+            reserved_ids=used_label_ids | (set(feat_asym_ids) - set(colliding_asym_ids)),
+            start=0,
+            limit=_LETTER_CHAIN_ID_LIMIT,
+        )
+        assigned_auth_ids = _assign_noncolliding_chain_ids(
+            colliding_ids=colliding_auth_ids,
+            reserved_ids=used_auth_ids | (set(feat_auth_ids) - set(colliding_auth_ids)),
+            start=OPAQUE_AUTH_ASYM_ID_START,
+        )
+        if assigned_label_ids:
+            remapped_asym_ids = feat["asym_id"].clone()
+            for old_id, new_id in assigned_label_ids.items():
+                remapped_asym_ids[feat["asym_id"] == old_id] = new_id
+            feat["asym_id"] = remapped_asym_ids
+        if assigned_auth_ids:
+            remapped_auth_ids = feat["auth_asym_id"].clone()
+            for old_id, new_id in assigned_auth_ids.items():
+                remapped_auth_ids[feat["auth_asym_id"] == old_id] = new_id
+            feat["auth_asym_id"] = remapped_auth_ids
+        if auth_chain_id_tables is not None:
+            auth_chain_id_tables[feat_i] = remap_auth_chain_id_table(
+                auth_chain_id_tables[feat_i],
+                assigned_auth_ids,
+            )
+        used_label_ids |= set(_unique_chain_ids(feat["asym_id"]))
+        used_auth_ids |= set(_unique_chain_ids(feat["auth_asym_id"]))
 
 
 def concat_features(
@@ -280,7 +356,10 @@ def concat_features(
     make_asym_ids_unique : bool, optional
         Whether to update the asym_ids and auth_asym_ids of all input features to make them unique.
         If True, update asym_ids and reset residue_index to start from 0 for each
-        asym_id. If False, preserve original asym_ids and auth_asym_ids and make residue_index
+        asym_id. Label ``asym_id`` remaps below ``_LETTER_CHAIN_ID_LIMIT``; auth
+        ``auth_asym_id`` remaps from ``OPAQUE_AUTH_ASYM_ID_START`` upward. The two
+        namespaces are independent.
+        If False, preserve original asym_ids and auth_asym_ids and make residue_index
         contiguous based on input order.
     make_entity_ids_unique : bool, optional
         Whether to update the entity_ids of all input features to make them unique.
@@ -383,41 +462,12 @@ def concat_features(
 
     # entity_id
     if make_entity_ids_unique:
-        used_entity_ids = features[0]["entity_id"].unique()
-        for feat in features[1:]:
-            if torch.isin(feat["entity_id"], used_entity_ids).any():
-                feat["entity_id"] += used_entity_ids.max() - feat["entity_id"].min() + 1
-                used_entity_ids = torch.cat([used_entity_ids, feat["entity_id"]]).unique()
+        output_entity_ids = update_ids([feat["entity_id"] for feat in features])
+    else:
+        output_entity_ids = torch.cat([feat["entity_id"] for feat in features])
 
-    # asym_id
     if make_asym_ids_unique:
-        used_asym_ids = torch.cat([features[0]["asym_id"].unique(), features[0]["auth_asym_id"].unique()])
-        available_asym_ids = torch.arange(26)
-        for feat in features[1:]:
-            available_asym_ids = available_asym_ids[~torch.isin(available_asym_ids, used_asym_ids)]
-            feat_asym_ids = feat["asym_id"].unique()
-            feat_asym_ids_to_update = feat_asym_ids[torch.isin(feat_asym_ids, used_asym_ids)]
-            feat_asym_ids_to_update_map = {
-                asym_id: available_asym_ids[i] for i, asym_id in enumerate(feat_asym_ids_to_update)
-            }
-            for asym_id, new_asym_id in feat_asym_ids_to_update_map.items():
-                feat["asym_id"][feat["asym_id"] == asym_id] = new_asym_id
-
-            auth_asym_ids = feat["auth_asym_id"].unique()
-            auth_asym_ids_to_update = auth_asym_ids[torch.isin(auth_asym_ids, used_asym_ids)]
-            auth_asym_ids_to_update_map = {
-                auth_asym_id: available_asym_ids[i] for i, auth_asym_id in enumerate(auth_asym_ids_to_update)
-            }
-            for auth_asym_id, new_auth_asym_id in auth_asym_ids_to_update_map.items():
-                feat["auth_asym_id"][feat["auth_asym_id"] == auth_asym_id] = new_auth_asym_id
-
-            used_asym_ids = torch.cat(
-                [
-                    used_asym_ids,
-                    torch.tensor(list(feat_asym_ids_to_update_map.values())),
-                    torch.tensor(list(auth_asym_ids_to_update_map.values())),
-                ]
-            )
+        _remap_colliding_chain_ids(features)
 
     # adjust indices to be consecutive
     # rule for resetting indices:
@@ -487,6 +537,10 @@ def concat_features(
             logger.error(f"feats[k].shape: {feats[k].shape}")
         raise e
 
+    if not isinstance(output_entity_ids, torch.Tensor):
+        raise ValueError(f"output_entity_ids expected to be tensor, but was {type(output_entity_ids)}")
+    feats_out["entity_id"] = output_entity_ids
+
     # checks and updates to ids
     # check that one asym_id is associated with only one entity_id
     asym_id_to_entity_id_map = {}
@@ -510,6 +564,43 @@ def concat_features(
                 feats_out["sym_id"][feats_out["asym_id"] == asym_ids[i]] = i
 
     return feats_out
+
+
+def concat_features_with_auth_tables(
+    features: list[dict[str, torch.Tensor]],
+    auth_chain_id_tables: list[dict[int, str]],
+    make_asym_ids_unique: bool,
+    make_entity_ids_unique: bool,
+    reset_residue_index: bool = True,
+) -> tuple[dict[str, torch.Tensor], dict[int, str]]:
+    """Copy and remap parallel auth tables, then concat. Caller tables are not mutated."""
+    if len(auth_chain_id_tables) != len(features):
+        raise ValueError("auth_chain_id_tables must have one table per concatenated feature dict")
+    cloned: list[dict[str, torch.Tensor]] = []
+    tables: list[dict[int, str]] = []
+    for feat, table in zip(features, auth_chain_id_tables, strict=True):
+        if len(feat["asym_id"]) == 0:
+            continue
+        cloned.append({k: v.clone() for k, v in feat.items()})
+        tables.append(dict(table))
+    cloned = [strip_chain_padding(feat) for feat in cloned]
+    tables = [
+        {
+            int(auth_id): chain_id
+            for auth_id, chain_id in table.items()
+            if int(auth_id) in set(_unique_chain_ids(feat["auth_asym_id"]))
+        }
+        for feat, table in zip(cloned, tables, strict=True)
+    ]
+    if make_asym_ids_unique and cloned:
+        _remap_colliding_chain_ids(cloned, tables)
+    concatenated = concat_features(
+        cloned,
+        make_asym_ids_unique=False,
+        make_entity_ids_unique=make_entity_ids_unique,
+        reset_residue_index=reset_residue_index,
+    )
+    return concatenated, merge_auth_chain_id_tables(tables)
 
 
 def crop_features(

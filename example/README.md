@@ -1,5 +1,5 @@
 # Examples
-This directory contains example binder design pipeline configurations that demonstrate some of the ways to customize featurization and simulation.The [table of contents](#examples-table-of-contents) below contains a description of each example configuration, and the [Customizing Your Design](#customizing-your-design) section describes key parameter to consider when setting up a pipeline.
+This directory contains example binder design pipeline configurations that demonstrate some of the ways to customize featurization and simulation. The [table of contents](#examples-table-of-contents) below contains a description of each example configuration, and the [Customizing Your Design](#customizing-your-design) section describes the parameters to set.
 
 # Examples Table of Contents
 
@@ -9,8 +9,16 @@ This directory contains example binder design pipeline configurations that demon
     - `vegf_1bj1_multichain_target.yaml` : Cropping syntax in the featurization configuration for designing against a multi-chain target.
     - `multiple_residue_specifications.yaml` : Cropping and hotspots using both the `original_residue_index` and `auth_residue_index` formats. The two featurization configurations in this file differ only by the residue input format and produce exactly the same output features for simulation.
     - `alternative_time_sampler.yaml` : Alternative log time sampler for the IL-7RA example. Compared to the linear time sampler, the log time sampler takes smaller steps towards the end of the trajectory close to `t=1`.
+    - `il7ra_3di3_loop_conditioning_config.yaml` : IL-7RA example. `design_conditioning` sets a loop-or-other binder and no homooligomer partner.
 - notebooks
     - `binder_design_pipeline_il7ra_3di3.ipynb` : IL-7RA example from the main README in a notebook environment.
+
+The six configuration examples above use Cicada (Psi-1.5 Cicada), the default
+checkpoint with short name `v1.5-cicada`.
+Five supply the `chain_is_loopy: NON_LOOP` and
+`has_homooligomer_partner: NO_PARTNER` baseline. The loop-conditioning example
+uses `chain_is_loopy: LOOP_OR_OTHER`; all six set
+`has_homooligomer_partner: NO_PARTNER`.
 
 # Customizing Your Design
 ## Customizing Featurization
@@ -34,8 +42,6 @@ For example, these are two equivalent featurizations for [TrkA](https://www.rcsb
 ### Choosing a binder center of mass
 Our model requires the user to specify an estimate for the center of mass of the binder chain relative to the target. We have achieved the best results by defining custom centers of mass. Below is an example of how to select a center of mass for [IL-7RA](https://www.rcsb.org/structure/3DI3) in [PyMOL](https://www.pymol.org/).
 
-Note that when you run the `dynopsi check` command, the entire structure will be globally translated to the binder center of mass.
-
 ```pymol
 # load the target structure into PyMOL
 fetch 3di3
@@ -46,7 +52,6 @@ color gray, chain B and 3di3
 # create a pseudo atom with a Van-der Waals radius of 10A
 # empirically this works for binders of length 60-120
 pseudoatom atom, pos=(0,0,0), vdw=10
-`TimeSamplers` allow you to control the number of steps taken by the solver and the density of these steps across the trajectory (from t=0 to t=1). Higher `num_steps` generally produces better results, but empirically we have observed diminishing returns above 100 steps.
 set sphere_transparency, 0.5, selection=atom
 color yellow, atom
 ```
@@ -62,6 +67,16 @@ Two time samplers are currently supported for controlling the denoising trajecto
 `YAML` / `Python`
 - `linear_time_sampler` / `LinearTimeSampler` : evenly spaces `num_steps` timesteps between `start_time` and `end_time`. We recommend this as a starting point with `start_time = 0.0` and `end_time = 1.0`.
 - `log_time_sampler` / `LogTimeSampler` : spaces steps on a logarithmic scale controlled by parameter `p > 0`. Higher `p` concentrates more steps near the end of the trajectory, which could lead to better fine-grained adjustments during the last denoising stages.
+
+Higher `num_steps` generally produces better results, with diminishing returns above 100 steps. The `sde_simulation` defaults are `num_steps: 60` and `self_conditioning_mode: previous_step`. Those are not the settings released with `dynopsi-1.ckpt`. That checkpoint needs:
+
+```yaml
+self_conditioning_mode: same_timestep
+time_sampler:
+  type: linear_time_sampler
+  num_steps: 100
+ode_warmup_max_t: 0.10
+```
 
 ### Time-dependent weighting of SDE/ODE component terms
 The ODE and SDE component terms receive time-dependent weights according to the diffusion coefficient, noise scale, and score scale inputs. These inputs are parameterized as functions of time `t ∈ [0, 1]`, and three functional forms are currently supported:

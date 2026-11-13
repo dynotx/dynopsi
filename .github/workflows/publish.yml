@@ -17,6 +17,8 @@ defaults:
 
 jobs:
   publish:
+    # Permanent safety guard: only the public release repository may publish.
+    if: github.repository == 'dynotx/dynopsi'
     runs-on: ubuntu-22.04
     environment:
       name: pypi
@@ -27,28 +29,73 @@ jobs:
         with:
           ref: main
           token: ${{ secrets.PUBLISH_PAT }}
+          fetch-depth: 0
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
         with:
           version: ${{ env.UV_VERSION }}
 
-      - name: Set version from release tag
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          VERSION="${{ github.event.release.tag_name }}"
-          VERSION="${VERSION#v}"
-          uv version "$VERSION"
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tag '$RELEASE_TAG' must be a lowercase-v stable semantic version (vMAJOR.MINOR.PATCH)."
+            exit 1
+          fi
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
 
-      - name: Commit version bump
+      - name: Apply release version
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml
-          git commit -m "chore: bump version to ${{ github.event.release.tag_name }}"
-          git push origin main
+          current_version="$(
+            python - <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as file:
+              print(tomllib.load(file)["project"]["version"])
+          PY
+          )"
+          if [[ "$current_version" == "$RELEASE_VERSION" ]]; then
+            echo "Package is already at $RELEASE_VERSION; continuing safely."
+          else
+            uv version "$RELEASE_VERSION"
+          fi
+
+      - name: Check lockfile
+        run: |
+          uv lock --check
+          python - <<'PY'
+          import os
+          import tomllib
+
+          expected = os.environ["RELEASE_VERSION"]
+          with open("pyproject.toml", "rb") as file:
+              package_version = tomllib.load(file)["project"]["version"]
+          with open("uv.lock", "rb") as file:
+              lock = tomllib.load(file)
+          lock_version = next(package["version"] for package in lock["package"] if package["name"] == "dynopsi")
+          if package_version != expected or lock_version != expected:
+              raise SystemExit(
+                  f"Release version mismatch: expected {expected}, "
+                  f"pyproject.toml has {package_version}, uv.lock has {lock_version}."
+              )
+          PY
 
       - name: Build
         run: uv build
+
+      - name: Commit release version
+        run: |
+          git add pyproject.toml uv.lock
+          if git diff --cached --quiet; then
+            echo "Version files are already committed at $RELEASE_VERSION."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: bump version to $RELEASE_VERSION"
+          git push origin HEAD:main
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

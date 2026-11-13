@@ -8,7 +8,7 @@ from dynopsi.simulation.observable import ObservableOutputConfig, OutputFormat, 
 from dynopsi.simulation.simulation import Simulation
 from dynopsi.simulation.simulation_pipeline import ODESimulation, SDESimulation
 from dynopsi.simulation.store import Store
-from dynopsi.simulation.time_sampler import LinearTimeSampler, LogTimeSampler
+from dynopsi.simulation.time_sampler import LinearTimeSampler, LogTimeSampler, QuadraticTimeSampler
 
 __all__ = [
     "Simulation",
@@ -16,6 +16,7 @@ __all__ = [
     "SDESimulation",
     "LinearTimeSampler",
     "LogTimeSampler",
+    "QuadraticTimeSampler",
     "ObservableOutputConfig",
     "Store",
     "InitializeStep",

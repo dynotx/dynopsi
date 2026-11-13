@@ -7,6 +7,12 @@ featurization_pipelines:
             crop_14_107: V14-107,W14-107
         hotspots:
             hotspot_81M_83I_91I: W81,W83,W91
+        binder_atoms_to_include: bb
+        design_conditioning:
+            chain_is_loopy:
+                non_loopy: NON_LOOP
+            has_homooligomer_partner:
+                no_partner: NO_PARTNER
         new_chains_lengths: [80]
         new_chains_centers_of_mass:
                 testcenter:
@@ -21,6 +27,12 @@ featurization_pipelines:
             crop_17_209: B17-209
         hotspots:
             hotspot_58V_80L_139Y: B58,B80,B139
+        binder_atoms_to_include: bb
+        design_conditioning:
+            chain_is_loopy:
+                non_loopy: NON_LOOP
+            has_homooligomer_partner:
+                no_partner: NO_PARTNER
         new_chains_lengths: [60]
         new_chains_centers_of_mass:
             hitcenter:
@@ -40,10 +52,11 @@ simulation_pipelines:
         noise_scale_fn:
             type: constant
             constant: 0.0
-        score_scale_fn:
+        ode_warmup_max_t: -1
+        ode_cooldown_score_scale_fn:
             type: constant
             constant: 0.0
-        t_thresh_score_weighting_only: 0.0
+        ode_cooldown_min_t: 0.0
 
     sde_test_config_2:
         type: sde_simulation
@@ -57,10 +70,11 @@ simulation_pipelines:
         noise_scale_fn:
             type: constant
             constant: 0.1
-        score_scale_fn:
+        ode_warmup_max_t: -1
+        ode_cooldown_score_scale_fn:
             type: constant
             constant: 0.0
-        t_thresh_score_weighting_only: 1.0
+        ode_cooldown_min_t: 1.0
 
     sde_test_config_3:
         type: sde_simulation
@@ -75,10 +89,11 @@ simulation_pipelines:
         noise_scale_fn:
             type: constant
             constant: 0.1
-        score_scale_fn:
+        ode_warmup_max_t: -1
+        ode_cooldown_score_scale_fn:
             type: constant
             constant: 1.5
-        t_thresh_score_weighting_only: 0.9
+        ode_cooldown_min_t: 0.9
 
     ode_test_config:
         type: ode_simulation
@@ -94,22 +109,18 @@ output_specifications:
 
 design_pipelines:
     il7ra_3di3_sde_test_config_1:
-        type: dynopsi_binder_design_pipeline
         featurization_pipeline: il7ra_3di3_binder_design
         simulation_pipeline: sde_test_config_1
         output_specification: default_output_specification
     il7ra_3di3_sde_test_config_2:
-        type: dynopsi_binder_design_pipeline
         featurization_pipeline: il7ra_3di3_binder_design
         simulation_pipeline: sde_test_config_3
         output_specification: default_output_specification
     vegfa_1bj1_sde_test_config_3:
-        type: dynopsi_binder_design_pipeline
         featurization_pipeline: vegfa_1bj1
         simulation_pipeline: sde_test_config_3
         output_specification: default_output_specification
     vegfa_1bj1_ode_test_config:
-        type: dynopsi_binder_design_pipeline
         featurization_pipeline: vegfa_1bj1
         simulation_pipeline: ode_test_config
         output_specification: default_output_specification

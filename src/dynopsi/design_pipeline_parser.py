@@ -4,10 +4,22 @@ import smart_open
 import yaml
 from pydantic import BaseModel
 
-from dynopsi.data.featurization.inference_featurization_pipeline import DynoPsiBinderDesignFeaturizationPipeline
+from dynopsi.data.featurization.inference_featurization_pipeline import (
+    get_featurization_pipeline_from_config,
+)
 from dynopsi.design_pipeline import DesignPipeline, OutputSpecification
-from dynopsi.model.model_config import DEFAULT_DYNOPSI_MODEL_CONFIG
-from dynopsi.simulation.simulation_pipeline.registry import get_simulation_pipeline_from_config
+from dynopsi.model.loaders import CheckpointSelectionError
+from dynopsi.model.model_config import (
+    DEFAULT_DYNOPSI_MODEL_CONFIG,
+    DynoPsiModelConfig,
+    resolve_checkpoint,
+)
+from dynopsi.simulation.simulation_pipeline.registry import (
+    get_simulation_pipeline_from_config,
+)
+
+_CONFIG_CHECKPOINT_ORIGIN = "the checkpoint: config key"
+_FLAG_CHECKPOINT_ORIGIN = "the --checkpoint flag"
 
 
 class DesignLanguageParser(BaseModel):
@@ -23,7 +35,12 @@ class DesignLanguageParser(BaseModel):
     examples/il7ra_3di3_config.yaml : Example configuration file for a design pipeline.
     """
 
-    def parse(self, path: str) -> list[DesignPipeline]:
+    def parse(
+        self,
+        path: str,
+        inference_model_config: DynoPsiModelConfig | None = None,
+        checkpoint: str | None = None,
+    ) -> list[DesignPipeline]:
         """Load and parse a YAML file into a list of design pipelines.
 
         Parameters
@@ -31,6 +48,11 @@ class DesignLanguageParser(BaseModel):
         path : str
             Path to a YAML configuration file that follows the
             design language schema.
+        inference_model_config : DynoPsiModelConfig or None
+            Model config to use for all simulation pipelines. When ``None``,
+            ``DEFAULT_DYNOPSI_MODEL_CONFIG`` is used.
+        checkpoint : str or None
+            Checkpoint short name from ``--checkpoint``. It is not a pre-built model config.
 
         Returns
         -------
@@ -52,9 +74,14 @@ class DesignLanguageParser(BaseModel):
         else:
             raise ValueError(f"Unsupported file extension: {path}")
 
-        return self.parse_design_dict(design_dict)
+        return self.parse_design_dict(design_dict, inference_model_config=inference_model_config, checkpoint=checkpoint)
 
-    def parse_design_dict(self, design_dict: dict[str, Any]) -> list[DesignPipeline]:
+    def parse_design_dict(
+        self,
+        design_dict: dict[str, Any],
+        inference_model_config: DynoPsiModelConfig | None = None,
+        checkpoint: str | None = None,
+    ) -> list[DesignPipeline]:
         """Parse a dictionary following design language schema into a list of design pipelines.
 
         Expects keys: `featurization_pipelines`, `simulation_pipelines`,
@@ -66,11 +93,24 @@ class DesignLanguageParser(BaseModel):
         ----------
         design_dict : dict[str, Any]
             Dictionary following design language schema (e.g. parsed from config).
+        inference_model_config : DynoPsiModelConfig or None
+            Model config for every simulation pipeline. When ``None``,
+            ``DEFAULT_DYNOPSI_MODEL_CONFIG`` is used.
+        checkpoint : str or None
+            Short name passed as ``--checkpoint``.
 
         Returns
         -------
         list[DesignPipeline]
             A list of `DesignPipeline` instances; pipeline per entry in `"design_pipelines"`.
+
+        Raises
+        ------
+        CheckpointSelectionError
+            If a simulation pipeline still carries an ``inference_model_config``
+            block, if the ``checkpoint:`` config value and ``--checkpoint`` name
+            different weights, if a checkpoint request is combined with a Python
+            ``inference_model_config``, or if the short name is unknown.
         """
         featurization_pipelines = {}
         simulation_pipelines = {}
@@ -80,9 +120,7 @@ class DesignLanguageParser(BaseModel):
         # parse featurization pipelines
         for featurization_pipeline_name, featurization_pipeline_dict in design_dict["featurization_pipelines"].items():
             featurization_pipeline_dict["name"] = featurization_pipeline_name
-            featurization_pipeline = DynoPsiBinderDesignFeaturizationPipeline.model_validate(
-                featurization_pipeline_dict
-            )
+            featurization_pipeline = get_featurization_pipeline_from_config(featurization_pipeline_dict)
             featurization_pipelines[featurization_pipeline_name] = featurization_pipeline
 
         # parse output configuration
@@ -92,10 +130,14 @@ class DesignLanguageParser(BaseModel):
 
         # parse simulation pipelines
         for simulation_pipeline_name, simulation_pipeline_dict in design_dict["simulation_pipelines"].items():
-            # add the inference model
-            simulation_pipeline_dict["inference_model_config"] = DEFAULT_DYNOPSI_MODEL_CONFIG.model_copy()
-            simulation_pipeline_dict["name"] = simulation_pipeline_name
-            simulation_pipeline = get_simulation_pipeline_from_config(simulation_pipeline_dict)
+            sim_dict = self._select_checkpoint(
+                simulation_pipeline_dict,
+                pipeline_name=simulation_pipeline_name,
+                flag_checkpoint=checkpoint,
+                python_model_config=inference_model_config,
+            )
+            sim_dict["name"] = simulation_pipeline_name
+            simulation_pipeline = get_simulation_pipeline_from_config(sim_dict)
             simulation_pipelines[simulation_pipeline_name] = simulation_pipeline
 
         # combine featurization and simulation pipelines into design pipelines
@@ -106,10 +148,57 @@ class DesignLanguageParser(BaseModel):
 
             design_pipeline = DesignPipeline(
                 name=design_pipeline_name,
-                inference_featurization_pipeline=featurization_pipeline,
+                featurization_pipeline=featurization_pipeline,
                 simulation_pipeline=simulation_pipeline,
                 output_specification=output_specification,
             )
             design_pipelines.append(design_pipeline)
 
         return design_pipelines
+
+    @staticmethod
+    def _select_checkpoint(
+        sim_dict: dict[str, Any],
+        *,
+        pipeline_name: str,
+        flag_checkpoint: str | None,
+        python_model_config: DynoPsiModelConfig | None,
+    ) -> dict[str, Any]:
+        """Return a copy that keeps the checkpoint request so ``resolved_design_config.json`` names the weights."""
+        # Copy so the caller's dict is unchanged and a second parse sees the same input.
+        selected = dict(sim_dict)
+        if "inference_model_config" in selected:
+            raise CheckpointSelectionError(
+                f"Simulation pipeline {pipeline_name!r} sets 'inference_model_config', which is no longer accepted. "
+                "Name the weights with 'checkpoint:' instead."
+            )
+
+        yaml_checkpoint = selected.get("checkpoint")
+        if yaml_checkpoint is not None and not isinstance(yaml_checkpoint, str):
+            raise CheckpointSelectionError(
+                f"checkpoint: {yaml_checkpoint!r} in simulation pipeline {pipeline_name!r} must be a string "
+                "such as 'v1'."
+            )
+        if python_model_config is not None and (yaml_checkpoint is not None or flag_checkpoint is not None):
+            raise CheckpointSelectionError(
+                f"Simulation pipeline {pipeline_name!r} receives a checkpoint request while a model config was "
+                "passed from Python; provide only one."
+            )
+        if yaml_checkpoint is not None and flag_checkpoint is not None and yaml_checkpoint != flag_checkpoint:
+            raise CheckpointSelectionError(
+                f"checkpoint: {yaml_checkpoint!r} in simulation pipeline {pipeline_name!r} and "
+                f"--checkpoint {flag_checkpoint!r} name different weights; provide matching values or only one."
+            )
+        if flag_checkpoint is not None:
+            request = flag_checkpoint
+            origin = _FLAG_CHECKPOINT_ORIGIN
+        elif yaml_checkpoint is not None:
+            request = yaml_checkpoint
+            origin = _CONFIG_CHECKPOINT_ORIGIN
+        else:
+            base = python_model_config or DEFAULT_DYNOPSI_MODEL_CONFIG
+            selected["inference_model_config"] = base.model_copy()
+            return selected
+        selected["checkpoint"] = request
+        selected["inference_model_config"] = resolve_checkpoint(request, origin=origin)
+        return selected

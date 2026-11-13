@@ -1,9 +1,8 @@
 from collections.abc import Iterable, Iterator
-from typing import Literal
+from typing import Literal, Self
 
 import torch
-from pydantic import BaseModel, Field, model_validator
-from typing_extensions import Self
+from pydantic import Field, model_validator
 
 from dynopsi.data.constants import InpaintFeature
 from dynopsi.data.featurization.base import Features, Featurizer
@@ -11,9 +10,10 @@ from dynopsi.data.featurization.registry import register_featurizer
 from dynopsi.data.featurization.utils import map_residue_to_atom_mask
 from dynopsi.data.utils import center_coordinates, randomly_rotate
 from dynopsi.utils.function_configs import SingleParameterFunctionType
+from dynopsi.utils.strict_config import StrictConfig
 
 
-class DataAugmentationConfig(BaseModel):
+class DataAugmentationConfig(StrictConfig):
     """Configuration of parameters for data augmentation.
 
      Supports the following data augmentation options:
@@ -25,11 +25,14 @@ class DataAugmentationConfig(BaseModel):
     ----------
     name : str, optional
         Identifier for this config.
-    centering_strategy : {'design_chains'}
+    centering_strategy : {'design_chains', 'unnoised_residues'}
         How to define the frame of reference:
         - 'design_chains': Center on all residues of any chains
           that include designed (i.e. noised) residues.
           For example, for the binder design task this is equivalent to
+          centering on binder residues.
+        - 'unnoised_residues': Center on all unnoised resolved residues.
+          For example, for the target docking task this is equivalent to
           centering on binder residues.
     random_global_translation_std : float, default=0.0
         Standard deviation of random global translation in Angstroms.
@@ -42,11 +45,11 @@ class DataAugmentationConfig(BaseModel):
     ValueError
         If `random_global_translation_std` is negative.
     ValueError
-        If `centering_strategy` is not 'design_chains'.
+        If `centering_strategy` is not 'design_chains' or 'unnoised_residues'.
     """
 
     name: str = Field(default_factory=str)
-    centering_strategy: Literal["design_chains"]
+    centering_strategy: Literal["design_chains", "unnoised_residues"]
     random_global_translation_std: float = 0.0
     random_global_rotation: bool = False
 
@@ -54,12 +57,12 @@ class DataAugmentationConfig(BaseModel):
     def _check(self) -> Self:
         if self.random_global_translation_std < 0:
             raise ValueError("random_global_translation_std must be non-negative")
-        if self.centering_strategy not in ["design_chains"]:
-            raise ValueError("centering_strategy must be 'design_chains'")
+        if self.centering_strategy not in ["design_chains", "unnoised_residues"]:
+            raise ValueError("centering_strategy must be 'design_chains' or 'unnoised_residues'")
         return self
 
 
-class PriorMeansConfig(BaseModel):
+class PriorMeansConfig(StrictConfig):
     """Configuration of parameters for prior means (centering and offset).
 
     Parameters
@@ -162,7 +165,15 @@ class CenterOfMassFeaturizer(Featurizer):
             else:
                 # center on the chains being designed
                 residue_center_mask = torch.isin(feature_dict["asym_id"], feature_dict["asym_id"][designed_mask])
-
+        elif self.data_augmentation_config.centering_strategy == "unnoised_residues":
+            # center on all unnoised resolved residues
+            if feature_dict["noised_mask"].bool().all():
+                raise ValueError("No unnoised residues to center on")
+            residue_center_mask = (
+                ~feature_dict["noised_mask"].bool()
+                & feature_dict["frame_resolved_mask"].bool()
+                & feature_dict["token_pad_mask"].bool()
+            )
         else:
             raise ValueError(f"Invalid centering strategy: {self.data_augmentation_config.centering_strategy}")
 

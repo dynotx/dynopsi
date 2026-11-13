@@ -1,23 +1,34 @@
 import logging
 from abc import abstractmethod
-from collections.abc import Iterable, Iterator
-from typing import Annotated, Literal
+from collections.abc import Callable, Iterable, Iterator
+from typing import Annotated, Literal, Self
 
 import numpy as np
 import torch
-from pydantic import BaseModel, Field, model_validator
-from typing_extensions import Self
+from pydantic import Field, model_validator
 
-from dynopsi.data.constants import AtomFilter, PocketFeature
+from dynopsi.data.auth_chain_identity import (
+    first_unused_auth_letters,
+    letter_stable_auth_ints,
+    merge_auth_chain_id_tables,
+    persisted_auth_ids,
+)
+from dynopsi.data.constants import FEATURE_KEYS, AtomFilter, PocketFeature
 from dynopsi.data.featurization.base import Features, Featurizer
+from dynopsi.data.featurization.binder_center import (
+    HotspotGeometryUnavailableError,
+    center_on_hotspot_axis,
+    sphere_exclusion_center,
+)
 from dynopsi.data.featurization.registry import register_featurizer
-from dynopsi.data.featurization.utils import concat_features, make_empty_chain
+from dynopsi.data.featurization.utils import concat_features, concat_features_with_auth_tables, make_empty_chain
 from dynopsi.data.utils import ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP
+from dynopsi.utils.strict_config import StrictConfig
 
 logger = logging.getLogger(__name__)
 
 
-class NewChainsCentersOfMass(BaseModel):
+class NewChainsCentersOfMass(StrictConfig):
     """Represents a function for returning the centers of mass for the new chains.
 
     Attribute
@@ -40,6 +51,42 @@ class NewChainsCentersOfMass(BaseModel):
     def __call__(self, features: Features, new_chain_lengths: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
         """Estimate the centers of mass for the new chains. Subclasses must implement this method."""
         ...
+
+
+class BinderCenterOfMassUnavailableError(ValueError):
+    pass
+
+
+def _coords_ca(features: Features) -> torch.Tensor:
+    if features["frames_idx"].shape[1] == 3:
+        return features["coords"][0, 1::3, :]
+    if features["frames_idx"].shape[1] == 1:
+        return features["coords"][0, :, :]
+    raise ValueError("CA position is ambiguous.")
+
+
+def _require_one_new_chain(new_chain_lengths: tuple[int, ...]) -> int:
+    if len(new_chain_lengths) != 1:
+        raise ValueError("new_chain_lengths must be a list of length 1")
+    return new_chain_lengths[0]
+
+
+def _place_on_hotspot_axis(
+    features: Features,
+    new_chain_lengths: tuple[int, ...],
+    distance_from_length: Callable[[int], float],
+) -> tuple[torch.Tensor, ...]:
+    length = _require_one_new_chain(new_chain_lengths)
+    try:
+        center = center_on_hotspot_axis(
+            _coords_ca(features),
+            features["pocket_feature"],
+            features["frame_resolved_mask"],
+            distance_from_length(length),
+        )
+    except HotspotGeometryUnavailableError as exc:
+        raise BinderCenterOfMassUnavailableError(str(exc)) from exc
+    return (center,)
 
 
 class BinderRgCenterOfMassEstimator(NewChainsCentersOfMass):
@@ -79,11 +126,11 @@ class BinderRgCenterOfMassEstimator(NewChainsCentersOfMass):
 
     def __call__(self, features: Features, new_chain_lengths: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
         """
-        Compute the center of mass of an idealized binder relative to the hotspot, based on the RFDiffusion 3 procedure.
+        Compute the center of mass of an idealized binder relative to the hotspot.
 
         Steps:
         1. Extract CA coordinates
-        2. Identify all target residues proximal to the hotspot. Proximal residues are defined as residues with a Ca-Ca distance less than 12 A to any hotspot, following RFDiffusion 3.
+        2. Identify all target residues proximal to the hotspot. Proximal residues are residues with a Ca-Ca distance less than 12 A to any hotspot.
         3. Compute the mean position of the CA atoms of these target residues.
         4. Find the vector V from the hotspot-proximal target mean to the hotspot mean.
         5. Estimate the distance D (angstroms) from the hotspot to the binder. The goal is for this to be the average
@@ -112,64 +159,52 @@ class BinderRgCenterOfMassEstimator(NewChainsCentersOfMass):
         ValueError: If the features don't have any hotspot residues or all pocket_feature residues are unspecified and
         inpaint_feature indicates that there are target residues.
         """
-        if len(new_chain_lengths) != 1:
-            raise ValueError("new_chain_lengths must be a list of length 1")
+        return _place_on_hotspot_axis(features, new_chain_lengths, self._estimate_distance_from_hotspot)
 
-        # check for expected cases
-        # pocket_feature unspecified
-        if (features["pocket_feature"] == PocketFeature.UNSPECIFIED).all():
-            raise ValueError("All of features['pocket_feature'] are UNSPECIFIED. This is not supported.")
-        else:
-            # check for no hotspot residues
-            if not (features["pocket_feature"] == PocketFeature.POCKET).any():
-                raise ValueError(
-                    "No residues designated as `POCKET` in `features['pocket_feature']`. Cannot estimate the binder center of mass."
-                )
-            # check for no target residues other than pocket
-            if not (features["pocket_feature"] == PocketFeature.UNSELECTED).any():
-                raise ValueError(
-                    "No residues designated as `UNSELECTED` in `features['pocket_feature']`. Cannot estimate the binder center of mass."
-                )
 
-        # ca atom position
-        if features["frames_idx"].shape[1] == 3:
-            coords_ca = features["coords"][0, 1::3, :]  # N x num_residues x 3
-        elif features["frames_idx"].shape[1] == 1:
-            coords_ca = features["coords"][0, :, :]  # N x num_residues x 3
-        else:
-            raise ValueError("CA position is ambiguous.")
+class SphereExclusionCenterEstimator(NewChainsCentersOfMass):
+    """Clash-aware binder COM along the hotspot outward axis.
 
-        hotspot_mask = features["pocket_feature"] == PocketFeature.POCKET  # N x num_tokens
-        target_non_hotspot_mask = features["pocket_feature"] == PocketFeature.UNSELECTED  # N x num_tokens
-        resolved_mask = features["frame_resolved_mask"].bool()  # N x num_tokens
+    Standoff ``D*``, exclusion wall ``R_excl``, and the YAML knobs are defined
+    in ``docs/featurization.md`` and ``sphere_exclusion_radii``.
+    """
 
-        coords_hotspot = coords_ca[hotspot_mask & resolved_mask]  # num_hotspot_residues x 3
-        coords_target_non_hotspot = coords_ca[
-            target_non_hotspot_mask & resolved_mask
-        ]  # num_target_non_hotspot_residues x 3
-        dist = torch.cdist(
-            coords_hotspot, coords_target_non_hotspot
-        )  # num_hotspot_residues x num_target_non_hotspot_residues
+    type: Literal["sphere_exclusion"] = "sphere_exclusion"
+    exclusion_offset: float = 0.0
+    exclusion_radius: float | None = None
 
-        ca_ca_interaction_dist = 12.0
-        hotspot_proximal_mask = (dist < ca_ca_interaction_dist).any(dim=0)  # num_target_non_hotspot_residues
-        target_center_of_mass = torch.cat([coords_target_non_hotspot[hotspot_proximal_mask], coords_hotspot]).mean(
-            dim=0
-        )  # 3
+    def check_num_chains_compatible(self, num_chains: int) -> bool:
+        return num_chains == 1
 
-        hotspot_center_of_mass = coords_hotspot.mean(dim=0)  # 3
+    def __call__(self, features: Features, new_chain_lengths: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+        length = _require_one_new_chain(new_chain_lengths)
+        try:
+            center = sphere_exclusion_center(
+                _coords_ca(features),
+                features["pocket_feature"],
+                features["frame_resolved_mask"],
+                length,
+                self.exclusion_offset,
+                self.exclusion_radius,
+            )
+        except (HotspotGeometryUnavailableError, RuntimeError) as exc:
+            raise BinderCenterOfMassUnavailableError(str(exc)) from exc
+        return (center,)
 
-        # vector from target center of mass to hotspot center of mass
-        vector = hotspot_center_of_mass - target_center_of_mass
 
-        # get unit vector
-        vector = vector / torch.norm(vector)
+_FIXED_HOTSPOT_OFFSET = 10.0
 
-        # center of mass of the binder is D on the vector from the hotspot center of mass
-        distance_from_hotspot = self._estimate_distance_from_hotspot(new_chain_lengths[0])
-        binder_center_of_mass = hotspot_center_of_mass + distance_from_hotspot * vector
 
-        return (binder_center_of_mass,)
+class FixedHotspotOffsetEstimator(NewChainsCentersOfMass):
+    """Binder COM 10 Å along the hotspot outward axis."""
+
+    type: Literal["fixed_hotspot_offset"] = "fixed_hotspot_offset"
+
+    def check_num_chains_compatible(self, num_chains: int) -> bool:
+        return num_chains == 1
+
+    def __call__(self, features: Features, new_chain_lengths: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+        return _place_on_hotspot_axis(features, new_chain_lengths, lambda _length: _FIXED_HOTSPOT_OFFSET)
 
 
 class PredefinedCenterOfMassEstimator(NewChainsCentersOfMass):
@@ -206,7 +241,11 @@ class PredefinedCenterOfMassEstimator(NewChainsCentersOfMass):
 # Discriminative union for NewChainsCentersOfMassFunctionType
 # Allows for automatic serialization/deserialization of the function.
 NewChainsCentersOfMassFunctionType = Annotated[
-    BinderRgCenterOfMassEstimator | PredefinedCenterOfMassEstimator, Field(discriminator="type")
+    BinderRgCenterOfMassEstimator
+    | PredefinedCenterOfMassEstimator
+    | FixedHotspotOffsetEstimator
+    | SphereExclusionCenterEstimator,
+    Field(discriminator="type"),
 ]
 
 
@@ -224,7 +263,10 @@ class NewChainsFeaturizer(Featurizer):
         Number of residues in each of the new chains.
     entity_ids: tuple[int, ...] = Field(default_factory=tuple)
         The entity ids of the new chains.
-        The default is for every new chain to have a unique entity id. If entity_ids is provided, chains with the same entity id must have the same length.
+        The default is for every new chain to have a unique entity id.
+        If entity_ids is provided, (1) chains with the same entity id must have the same length
+        and (2) the entity ID groups will be preserved, even if the values change. For example,
+        (0, 0, 1)->(1, 1, 2).
     atoms_to_include: AtomFilter | None = None
         Atoms to include in the new chains.
     estimate_centers_of_mass_function: NewChainsCentersOfMassFunctionType
@@ -262,7 +304,7 @@ class NewChainsFeaturizer(Featurizer):
     @property
     def sym_ids(self) -> tuple[int, ...]:
         """Return a tuple of sym_ids to use for the new chains."""
-        if self.entity_ids is not None:
+        if self.entity_ids:
             sym_ids_lst = []
             entities_counter = {entity_id: 0 for entity_id in self.entity_ids}
             for entity_id in self.entity_ids:
@@ -272,14 +314,14 @@ class NewChainsFeaturizer(Featurizer):
         else:
             return tuple(0 for _ in range(len(self.lengths)))
 
-    def get_new_asym_ids(self, num_new_chains: int, asym_ids_in_use: set[int]) -> tuple[int, ...]:
-        """Get new asym_ids to use for the new chains."""
-        valid_asym_ids = [x for x in ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP.keys() if x not in asym_ids_in_use]
-        if len(valid_asym_ids) < num_new_chains:
+    def get_new_unique_ids(self, num_new_chains: int, ids_in_use: set[int]) -> tuple[int, ...]:
+        """Get new unique ids to use for the new chains."""
+        valid_ids = [x for x in ASYM_ID_TO_SINGLE_LETTER_CHAIN_MAP.keys() if x not in ids_in_use]
+        if len(valid_ids) < num_new_chains:
             raise ValueError(
-                f"Not enough valid asym ids to use for the new chains. Need {num_new_chains}, but only {len(valid_asym_ids)} are available."
+                f"Not enough valid ids to use for the new chains. Need {num_new_chains}, but only {len(valid_ids)} are available."
             )
-        return tuple(valid_asym_ids[:num_new_chains])
+        return tuple(valid_ids[:num_new_chains])
 
     def __call__(self, inputs: Iterable[Features]) -> Iterator[Features]:
         """Concatenate new chains to the input.
@@ -329,17 +371,42 @@ class NewChainsFeaturizer(Featurizer):
 
             new_chains = []
 
-            # determine the new asym_ids to use for the new chains to avoid collisions with existing asym_ids
-            # these are defined by (1) the pdb chain IDs and (2) the author chain IDs
-            # for simplicity, the new chains will have the same asym_id and auth_asym_id
-            asym_ids_in_use = set(
-                new_feats.feature_dict["asym_id"].unique().tolist()
-                + new_feats.feature_dict["auth_asym_id"].unique().tolist()
+            existing_auth_ints = (
+                new_feats.feature_dict.get("auth_asym_id", torch.tensor([], dtype=torch.long)).unique().tolist()
             )
-            new_asym_ids = self.get_new_asym_ids(num_new_chains=len(self.lengths), asym_ids_in_use=asym_ids_in_use)
+            persisted_target_auth_ids = persisted_auth_ids(existing_auth_ints, new_feats.auth_chain_id_table)
+            new_auth_letters = first_unused_auth_letters(
+                num_letters=len(self.lengths),
+                persisted_ids=persisted_target_auth_ids,
+            )
+            new_auth_ints = letter_stable_auth_ints(new_auth_letters)
+            new_chain_auth_table = dict(zip(new_auth_ints, new_auth_letters, strict=True))
 
-            for new_length, asym_id, sym_id, entity_id, com in zip(
-                self.lengths, new_asym_ids, self.sym_ids, self.entity_ids, centers_of_mass
+            # Label ids from live asym_id, not auth ints.
+            asym_ids_in_use = set(
+                new_feats.feature_dict.get("asym_id", torch.tensor([], dtype=torch.long)).unique().tolist()
+            )
+            new_asym_ids = self.get_new_unique_ids(num_new_chains=len(self.lengths), ids_in_use=asym_ids_in_use)
+
+            entity_ids_in_use = (
+                new_feats.feature_dict.get("entity_id", torch.tensor([], dtype=torch.long)).unique().tolist()
+            )
+
+            new_unique_entity_ids = self.get_new_unique_ids(
+                num_new_chains=len(set(self.entity_ids)), ids_in_use=entity_ids_in_use
+            )
+            entity_id_to_new_entity_id_map = {
+                eid: new_entity_id for eid, new_entity_id in zip(list(set(self.entity_ids)), new_unique_entity_ids)
+            }
+            new_entity_ids = [entity_id_to_new_entity_id_map[eid] for eid in self.entity_ids]
+
+            if len(new_feats.feature_dict) == 0:
+                keys_to_include = FEATURE_KEYS
+            else:
+                keys_to_include = list(new_feats_keys)
+
+            for new_length, asym_id, auth_asym_id, sym_id, entity_id, com in zip(
+                self.lengths, new_asym_ids, new_auth_ints, self.sym_ids, new_entity_ids, centers_of_mass, strict=True
             ):
                 new_chains.append(
                     make_empty_chain(
@@ -348,10 +415,10 @@ class NewChainsFeaturizer(Featurizer):
                         coords_center_of_mass=com,
                         res_type="UNK",
                         asym_id=asym_id,
-                        auth_asym_id=asym_id,
+                        auth_asym_id=auth_asym_id,
                         sym_id=sym_id,
                         entity_id=entity_id,
-                        keys_include=list(new_feats_keys),
+                        keys_include=keys_to_include,
                         pocket_feature=pocket_feature,
                     )
                 )
@@ -360,9 +427,15 @@ class NewChainsFeaturizer(Featurizer):
 
             if len(new_feats.keys()) == 0:
                 new_feats.feature_dict = concat_new_chains
+                new_feats.auth_chain_id_table = merge_auth_chain_id_tables(
+                    [new_feats.auth_chain_id_table, new_chain_auth_table]
+                )
             else:
-                new_feats.feature_dict = concat_features(
-                    [new_feats.feature_dict, concat_new_chains], make_asym_ids_unique=True, make_entity_ids_unique=True
+                new_feats.feature_dict, new_feats.auth_chain_id_table = concat_features_with_auth_tables(
+                    [new_feats.feature_dict, concat_new_chains],
+                    [new_feats.auth_chain_id_table, new_chain_auth_table],
+                    make_asym_ids_unique=True,
+                    make_entity_ids_unique=True,
                 )
 
             self._update_features_metadata(new_feats)

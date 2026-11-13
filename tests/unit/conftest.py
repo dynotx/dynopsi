@@ -1,7 +1,23 @@
+from __future__ import annotations
+
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+
+from dynopsi.data import conditioning
+from dynopsi.data.conditioning import CategoricalCondition
+
+
+@pytest.fixture
+def register_categorical_condition(monkeypatch) -> Callable[[CategoricalCondition], None]:
+    """Append a test-only condition to ``CATEGORICAL_CONDITIONS`` for the duration of one test."""
+
+    def _register(condition: CategoricalCondition) -> None:
+        monkeypatch.setattr(conditioning, "CATEGORICAL_CONDITIONS", conditioning.CATEGORICAL_CONDITIONS + (condition,))
+
+    return _register
 
 
 @pytest.fixture

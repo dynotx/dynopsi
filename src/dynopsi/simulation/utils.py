@@ -1,8 +1,6 @@
-from typing import TypeAlias
-
 import torch
 
-ValidSteps: TypeAlias = dict[str, list[int]]
+type ValidSteps = dict[str, list[int]]
 
 
 def all_steps_for_modalities(modalities: list[str], num_steps: int) -> ValidSteps:
@@ -62,20 +60,16 @@ def is_active_at(valid_steps: ValidSteps, step_num: int) -> bool:
     return any(step_num in valid_steps[modality] for modality in valid_steps)
 
 
-def infer_batch_size(devices: list[torch.device]) -> int:
-    """Infer the batch size for the given devices as min batch size for all devices."""
-    sizes = []
-    for device in devices:
-        if device.type == "cpu":
-            return 1
+def infer_batch_size(device: torch.device) -> int:
+    """Infer a batch size that fits on one device."""
+    if device.type == "cpu":
+        return 1
 
-        device_memory = torch.cuda.get_device_properties(device).total_memory
-        device_memory_gb = device_memory / 1e9
+    device_memory = torch.cuda.get_device_properties(device).total_memory
+    device_memory_gb = device_memory / 1e9
 
-        if device_memory_gb >= 80:  # H100/A100 80GB
-            sizes.append(5)
-        elif device_memory_gb >= 40:  # A100 40GB
-            sizes.append(2)
-        else:
-            sizes.append(1)
-    return min(sizes)
+    if device_memory_gb >= 80:  # H100/A100 80GB
+        return 5
+    if device_memory_gb >= 40:  # A100 40GB
+        return 2
+    return 1
