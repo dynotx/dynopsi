@@ -55,13 +55,7 @@ def _reject_insertion_codes(structure: gemmi.Structure) -> None:
 
 def load_or_parse_ccd(ccd_path: Path | str = AA_CCD_CIF_FILE) -> dict[str, Mol]:
     """Load the CCD dictionary of residue name to rdkit.Chem.rdchem.Mol."""
-    try:
-        from pdbeccdutils.core import ccd_reader
-    except ImportError as exc:
-        raise ImportError(
-            "load_or_parse_ccd requires the optional 'structure-parsing' extra "
-            "(pdbeccdutils/rdkit). Install it with `uv sync --extra workspace`."
-        ) from exc
+    from pdbeccdutils.core import ccd_reader
 
     components = ccd_reader.read_pdb_components_file(str(ccd_path))
     ccd: dict[str, Mol] = {}

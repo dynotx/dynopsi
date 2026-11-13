@@ -132,7 +132,7 @@ ode_cooldown_score_scale_fn:
 ode_cooldown_min_t: 0.9
 ```
 
-Leave `diffusion_coefficient_fn` and `noise_scale_fn` as they are. An SDE configuration hits this failure. An ODE configuration does not.
+Leave `diffusion_coefficient_fn` and `noise_scale_fn` as they are. An SDE configuration hits this failure. An ODE configuration does not. This `-1` block reproduces 1.0.0. The README Psi-1 starting schedule uses `ode_warmup_max_t: 0.10`.
 
 ### Change 3
 
@@ -156,7 +156,7 @@ Leave `diffusion_coefficient_fn` and `noise_scale_fn` as they are. An SDE config
 
 **New form.** The same entry naming `featurization_pipeline`, `simulation_pipeline`, and `output_specification`, without `type`.
 
-**Required change.** None for a configuration that already runs. 2.0.0 reads those three names and drops every other key on the entry, including `type`, as 1.0.0 did. The major version bump is why `type` stays ignored.
+**Required change.** None for a configuration that already runs. 2.0.0 reads those three names and drops every other key on the entry, including `type`, as 1.0.0 did.
 
 ### Change 6
 
@@ -164,7 +164,7 @@ Leave `diffusion_coefficient_fn` and `noise_scale_fn` as they are. An SDE config
 
 **New form.** The step is absent.
 
-**Required change.** Remove the step. That `type` is rejected. No 1.0.0 example sets it. The major version bump is why 2.0.0 adds no compatibility shim.
+**Required change.** Remove the step. That `type` is rejected. No 1.0.0 example sets it.
 
 ### Change 7
 
@@ -174,7 +174,7 @@ Leave `diffusion_coefficient_fn` and `noise_scale_fn` as they are. An SDE config
 
 **Required change.** None if you keep `formats: [pdb, npz]`. That list still works. 1.0.0 already accepts `mmcif` in `formats`. The recommendation moved. The library does not default to `mmcif`.
 
-Leaving `formats` out of an `output_dir` / `formats` / `save_trajectory` block raises. Leaving it out is valid when `observable_output_configs` supplies the formats. In the `formats` list, and in the Python `output_format` argument, the spelling is `mmcif`. `dynopsi check --format` accepts `pdb` or `cif` and converts `cif` to `mmcif`. Saved structure files use `.cif`.
+Leaving `formats` out of an `output_dir` / `formats` / `save_trajectory` block raises. Leaving it out is valid when `observable_output_configs` supplies the formats. In the `formats` list, and in the Python `output_format` argument, the spelling is `mmcif`. `dynopsi check --format` accepts `pdb` or `cif` and converts `cif` to `mmcif`. Sampling writes `mmcif` as `.cif`. `dynopsi check --format cif` writes the preview as `.mmcif`.
 
 ### Change 8
 

@@ -47,25 +47,12 @@ jobs:
           echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
 
       - name: Apply release version
-        run: |
-          current_version="$(
-            python - <<'PY'
-          import tomllib
-
-          with open("pyproject.toml", "rb") as file:
-              print(tomllib.load(file)["project"]["version"])
-          PY
-          )"
-          if [[ "$current_version" == "$RELEASE_VERSION" ]]; then
-            echo "Package is already at $RELEASE_VERSION; continuing safely."
-          else
-            uv version "$RELEASE_VERSION"
-          fi
+        run: uv version "$RELEASE_VERSION"
 
       - name: Check lockfile
         run: |
           uv lock --check
-          python - <<'PY'
+          uv run --no-project --python 3.12 python - <<'PY'
           import os
           import tomllib
 

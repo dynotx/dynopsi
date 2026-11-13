@@ -8,8 +8,7 @@ Users of `dynopsi==1.0.0` start at [MIGRATION.md](https://github.com/dynotx/dyno
 
 This repository enables inference and sampling for Cicada, the default Psi model (Psi-1.5 Cicada). Psi is a family of *de novo* miniprotein binder design models developed by Dyno Therapeutics. The binder design pipeline is configurable and modular, supporting binder generation against both single and multi-chain targets. Backbone atom coordinates are output for each designed binder and can be exported in multiple formats for downstream analysis. [ProteinMPNN](https://github.com/dauparas/ProteinMPNN) is recommended to generate accompanying sequences, and recommended settings are provided below [in the sequence design section](#sequence-design-with-proteinmpnn).
 
-`dynopsi` 2.0.0 is the package; the default model is Psi-1.5 Cicada. Psi-1 remains `checkpoint: v1`.
-Cicada is the recommended starting checkpoint. See [Checkpoints](#checkpoints).
+`dynopsi` 2.0.0 is the package; the default model is Psi-1.5 Cicada. Psi-1 remains `checkpoint: v1`. See [Checkpoints](#checkpoints).
 
 Psi model checkpoints and supplementary datasets are hosted on Hugging Face
 [![🤗 Hugging Face](https://img.shields.io/badge/🤗%20Hugging%20Face-DynoTx-F1E0CC)](https://huggingface.co/dynotx).
@@ -74,13 +73,13 @@ This is where you provide a target, optionally crop your target, and specify hot
 - Define the chain ID / indexing strategy used for the featurization specification
   - `index_type` : Which index strategy is used. Options are `original_residue_index`, `auth_residue_index`, described below:
     - `auth_residue_index`: Use the Author-defined indexing: residue indices and chain IDs are defined by the author of the deposited structure file.
-    - `original_residue_index`: Use standard PDB indexing: all residue indices start at 1 within each chain and the chain ID is the standard PDB chain ID.
+    - `original_residue_index`: chains are labeled A, B, C, … and each chain's residues start at 1.
 
     We recommend loading your structure in [Mol*Viewer](https://molstar.org/viewer/) to select chains and indices. Mol*Viewer explicitly annotates with "AUTH" in scenarios where the author-defined chain ID and residue indexing diverges from standard PDB indexing.
 
     It is strongly recommended that you [check](#check-design-pipeline) the output featurization before generating designs to make sure that you have defined the correct chain/index parameters, especially if you use `auth_residue_index`.
 
-Four additional featurization arguments shape the fanout: `crops`, `hotspots`, `new_chains_lengths`, and `new_chains_centers_of_mass`. Omit `crops` to use the whole structure; the other three must be non-empty. Each accepts multiple configurations. Their Cartesian product yields one featurization per combination, and each combination is simulated sequentially.
+Four additional featurization arguments: `crops`, `hotspots`, `new_chains_lengths`, and `new_chains_centers_of_mass`. Omit `crops` to use the whole structure; the other three must be non-empty. Each accepts multiple configurations. Their Cartesian product yields one featurization per combination, and each combination is simulated sequentially.
 
 - `crops` : A dictionary of {crop_name : crop_range}.
 - `hotspots` : A dictionary of {hotspot_name : hotspot_positions}.
@@ -148,7 +147,7 @@ The loop label (`chain_is_loopy`) accepts `NON_LOOP`, `LOOP_OR_OTHER`, and `MASK
 
 Place the binder center with one of these types. `L` is the binder length in residues. The outward axis, used by the radius-of-gyration type, runs from the mean of the hotspot Cα together with resolved target Cα within 12 Å of the hotspot, through the hotspot mean.
 
-- `predefined_center_of_mass`: the coordinate you supply is the center.
+- `predefined_center_of_mass`: the coordinate you supply is the center. The PyMOL recipe is [Choosing a binder center of mass](https://github.com/dynotx/dynopsi/blob/main/example/README.md#choosing-a-binder-center-of-mass).
 - `sphere_exclusion`: the center is placed from the hotspot geometry. The target standoff from hotspot Cα, in angstroms, is `D* = 2.2 · L^0.38 + 1.7 + exclusion_offset`. The placed center stays at least `R_excl` from resolved target Cα. `R_excl` equals `D*` unless you set `exclusion_radius`. `exclusion_offset` and `exclusion_radius` are optional.
 - `estimate_binder_center_of_mass_radius_of_gyration`: the center sits on the outward axis, `2.11 · L^0.37 + 3.65` angstroms from the hotspot mean, clipped to `power_law_min_val`–`power_law_max_val` (5–30 Å by default). That distance estimates the binder radius of gyration. Optional overrides are `power_law_scale`, `power_law_exponent`, `power_law_offset`, `power_law_min_val`, and `power_law_max_val`. The `type` line alone is a complete entry.
 
@@ -160,7 +159,7 @@ new_chains_centers_of_mass:
 
 ### Simulation
 
-The simulation configuration controls the sampler, including which solver to use (ODE/SDE) and its parameters. Beyond the default solvers, sampling behavior can be customized by composing `Ops` — instructions that define the denoising trajectory — into a `Simulation` procedure. This can impose symmetry or otherwise modify the sampling dynamics. For miniprotein binder design, we recommend the following defaults:
+The simulation configuration controls the sampler, including which solver to use (ODE/SDE) and its parameters. Beyond the default solvers, sampling behavior can be customized by composing `Ops` — instructions that define the denoising trajectory — into a `Simulation` procedure. For miniprotein binder design, we recommend the following defaults:
 
 YAML version:
 
@@ -214,7 +213,7 @@ simulation = SDESimulation(
 
 The sampler fields above are the defaults for Psi-1.5 Cicada (`v1.5-cicada`, file `dynopsi-1.5-cicada.ckpt`). Sampling with Cicada requires a loop label (`chain_is_loopy`) and a homooligomer-partner label (`has_homooligomer_partner`); you set both, as in the [featurization example](#an-example). If you set neither `checkpoint:` nor `--checkpoint`, the run uses `v1.5-cicada`.
 
-Psi-1 (`v1`, file `dynopsi-1.ckpt`) is the previous checkpoint. Set `checkpoint: v1` or pass `--checkpoint v1`. That checkpoint needs `self_conditioning_mode: same_timestep`, `num_steps: 100`, and `ode_warmup_max_t: 0.10`. Psi-1 has no loop or homooligomer-partner conditioning, so omit `design_conditioning`.
+Psi-1 (`v1`, file `dynopsi-1.ckpt`) is the previous checkpoint. Set `checkpoint: v1` or pass `--checkpoint v1`. That checkpoint needs `self_conditioning_mode: same_timestep`, `num_steps: 100`, and `ode_warmup_max_t: 0.10`. Psi-1 has no loop or homooligomer-partner conditioning, so omit `design_conditioning`. The 1.0.0 reproduction is [Change 2](https://github.com/dynotx/dynopsi/blob/main/MIGRATION.md#change-2).
 
 If you set both `checkpoint:` and `--checkpoint`, they must name the same weights. A YAML file cannot set `inference_model_config`; name the weights with `checkpoint:` there. In Python, pass `inference_model_config` or a checkpoint request, not both. To build the config yourself:
 
@@ -235,7 +234,7 @@ Pass `revision` to pin a commit. Omitting it uses the current file on Hugging Fa
 
 Set `formats`, the output directory, and whether to save the full sampling trajectory. The recommended list is `formats: [mmcif, npz]`. `mmcif` is a structure file written as `.cif`, and `pdb` is written as `.pdb`. `npz` is a structure archive and can accompany either structure format. `formats: [pdb, npz]` is still valid.
 
-> **Note:** Saving trajectories requires significantly more time and disk space and is not recommended for large-scale runs.
+Saving trajectories requires significantly more time and disk space and is not recommended for large-scale runs.
 
 YAML version:
 
