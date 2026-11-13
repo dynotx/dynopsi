@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from abc import ABC, abstractmethod
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,18 @@ from dynopsi.model import DynoPsiModel
 
 class CheckpointSelectionError(ValueError):
     """A checkpoint request did not name a published short name."""
+
+
+class CheckpointIntegrityError(RuntimeError):
+    """A downloaded checkpoint did not match its published SHA-256."""
+
+
+@cache
+def _verify_checkpoint_sha256(path: str, expected_sha256: str) -> None:
+    with open(path, "rb") as checkpoint_file:
+        actual_sha256 = hashlib.file_digest(checkpoint_file, "sha256").hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise CheckpointIntegrityError(f"Checkpoint SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}.")
 
 
 def _assert_state_dict_keys_match(
@@ -120,24 +134,29 @@ class DynoPsiLoader(ABC):
 class HuggingFaceLoader(DynoPsiLoader):
     """Download a checkpoint from Hugging Face and rehydrate it into a DynoPsiModel."""
 
-    def __init__(self, repo_id: str, filename: str, revision: str | None = None) -> None:
+    def __init__(self, repo_id: str, filename: str, revision: str, expected_sha256: str) -> None:
         """
         Parameters
         ----------
         repo_id : str
-            Hugging Face repo (for example ``owner/model-name``).
+            Hugging Face repository containing the published checkpoint.
         filename : str
             Checkpoint filename in the repo.
-        revision : str or None
-            Repo git revision to download. ``None`` tracks the default branch.
+        revision : str
+            Pinned repository commit containing the checkpoint.
+        expected_sha256 : str
+            Published SHA-256 of the checkpoint file.
         """
         self.repo_id = repo_id
         self.filename = filename
         self.revision = revision
+        self.expected_sha256 = expected_sha256
 
     def path(self) -> str:
-        return hf_hub_download(repo_id=self.repo_id, filename=self.filename, revision=self.revision)
+        path = hf_hub_download(repo_id=self.repo_id, filename=self.filename, revision=self.revision)
+        _verify_checkpoint_sha256(path, self.expected_sha256)
+        return path
 
     def read(self, map_location: str | torch.device = "cpu") -> dict[str, Any]:
-        """Download the checkpoint and return the raw dict."""
+        """Download and verify the checkpoint, then return the raw dict."""
         return _read_checkpoint(self.path(), map_location)

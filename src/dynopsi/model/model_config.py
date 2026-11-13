@@ -22,7 +22,9 @@ from dynopsi.utils.strict_config import StrictConfig
 
 CHECKPOINT_REPO_ID = "dynotx/dynopsi"
 _V1_REVISION = "346e377be69ca2a8a78e6f921c08e2f3aa7b6e18"
+_V1_SHA256 = "c99f19a445992b6f6d4792f2ba27a27625b20379554d5389c1f6d2b7f43d404f"
 _V1_5_CICADA_REVISION = "f55d9e684659aaf627b5bfa4ab05f735a3398951"
+_V1_5_CICADA_SHA256 = "7a5bbc43efde45bbf04489ef280d2067751ba6f8a652c3aab8b510b91d1b3d39"
 _PRIOR_FREE_PLACEHOLDER_STDS: dict[str, float] = {"coords": 1.0}
 _prior_free: ContextVar[bool] = ContextVar("dynopsi_model_config_prior_free", default=False)
 
@@ -33,7 +35,7 @@ class PriorFreeConstructionError(RuntimeError):
 
 @dataclass(frozen=True)
 class PublishedCheckpoint:
-    """Hugging Face file and commit SHA a checkpoint short name resolves to.
+    """Hugging Face file, commit, and checksum a checkpoint short name resolves to.
 
     Attributes
     ----------
@@ -41,27 +43,31 @@ class PublishedCheckpoint:
         Checkpoint filename in :data:`CHECKPOINT_REPO_ID`.
     revision : str
         Repo git commit SHA to download.
+    sha256 : str
+        Expected SHA-256 of the downloaded checkpoint.
     """
 
     filename: str
     revision: str
+    sha256: str
 
 
 DEFAULT_CHECKPOINT_NAME = "v1.5-cicada"
 CHECKPOINT_SHORT_NAMES: dict[str, PublishedCheckpoint] = {
-    "v1": PublishedCheckpoint(filename="dynopsi-1.ckpt", revision=_V1_REVISION),
+    "v1": PublishedCheckpoint(filename="dynopsi-1.ckpt", revision=_V1_REVISION, sha256=_V1_SHA256),
     DEFAULT_CHECKPOINT_NAME: PublishedCheckpoint(
         filename="dynopsi-1.5-cicada.ckpt",
         revision=_V1_5_CICADA_REVISION,
+        sha256=_V1_5_CICADA_SHA256,
     ),
 }
 
 
 class HuggingFaceLoaderConfig(StrictConfig):
-    """Download a checkpoint from the Hugging Face Hub.
+    """Identify a supported published checkpoint on the Hugging Face Hub.
 
-    ``revision`` pins a repo git revision. A commit SHA keeps the weights fixed
-    if the same filename is later re-uploaded. ``None`` tracks the default branch.
+    Loading accepts only the exact repository, filename, and pinned revision
+    associated with a published DynoPsi checkpoint short name.
 
     Attributes
     ----------
@@ -149,8 +155,27 @@ class DynoPsiModelConfig(StrictConfig):
         self.dynopsi_model.to_device(device)
         self.device_name = str(device)
 
+    def _published_checkpoint(self) -> PublishedCheckpoint:
+        for published in CHECKPOINT_SHORT_NAMES.values():
+            if (
+                self.loader.repo_id == CHECKPOINT_REPO_ID
+                and self.loader.filename == published.filename
+                and self.loader.revision == published.revision
+            ):
+                return published
+        known = ", ".join(sorted(CHECKPOINT_SHORT_NAMES))
+        raise CheckpointSelectionError(
+            f"Unsupported checkpoint source. Use resolve_checkpoint() with a published short name: {known}."
+        )
+
     def _loader(self) -> HuggingFaceLoader:
-        return HuggingFaceLoader(self.loader.repo_id, self.loader.filename, self.loader.revision)
+        published = self._published_checkpoint()
+        return HuggingFaceLoader(
+            self.loader.repo_id,
+            self.loader.filename,
+            published.revision,
+            published.sha256,
+        )
 
     def _refuse_load_inside_prior_free(self) -> None:
         if _prior_free.get():

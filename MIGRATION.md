@@ -194,21 +194,15 @@ simulation_pipelines:
     checkpoint: v1.5-cicada
 ```
 
-Python passes one loader:
+Python resolves the same published model by short name:
 
 ```python
-from dynopsi.model.model_config import DynoPsiModelConfig, HuggingFaceLoaderConfig
+from dynopsi.model.model_config import resolve_checkpoint
 
-DynoPsiModelConfig(
-    loader=HuggingFaceLoaderConfig(
-        repo_id="dynotx/dynopsi",
-        filename="dynopsi-1.5-cicada.ckpt",
-        revision="f55d9e684659aaf627b5bfa4ab05f735a3398951",
-    ),
-)
+resolve_checkpoint("v1.5-cicada")
 ```
 
-**Required change.** Delete the YAML `inference_model_config` key. 2.0.0 rejects it. Set `checkpoint:` to the short name of a published model. In Python, those three failures arrive together: field `loader` has type `missing`, and fields `repo_id` and `filename` have type `extra_forbidden`.
+**Required change.** Delete the YAML `inference_model_config` key. 2.0.0 rejects it. Set `checkpoint:` to the short name of a published model. In Python, resolve the published short name; arbitrary checkpoint repositories, files, and revisions are unsupported.
 
 ### Change 9
 

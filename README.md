@@ -218,17 +218,12 @@ Psi-1 (`v1`, file `dynopsi-1.ckpt`) is the previous checkpoint. Set `checkpoint:
 If you set both `checkpoint:` and `--checkpoint`, they must name the same weights. A YAML file cannot set `inference_model_config`; name the weights with `checkpoint:` there. In Python, pass `inference_model_config` or a checkpoint request, not both. To build the config yourself:
 
 ```python
-from dynopsi.model.model_config import DynoPsiModelConfig, HuggingFaceLoaderConfig
+from dynopsi.model.model_config import resolve_checkpoint
 
-inference_model_config = DynoPsiModelConfig(
-    loader=HuggingFaceLoaderConfig(
-        repo_id="dynotx/dynopsi",
-        filename="dynopsi-1.5-cicada.ckpt",
-    ),
-)
+inference_model_config = resolve_checkpoint("v1.5-cicada")
 ```
 
-Pass `revision` to pin a commit. Omitting it uses the current file on Hugging Face.
+DynoPsi supports only its published `v1.5-cicada` and `v1` checkpoint short names. Each name resolves to an immutable Hugging Face revision, and the downloaded file must match its published SHA-256 before loading. Arbitrary repositories, files, and revisions are rejected.
 
 ### Output Configuration
 

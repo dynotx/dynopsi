@@ -1,5 +1,6 @@
 """Strict load of a fixture checkpoint that uses the published hyperparameter names."""
 
+import hashlib
 import inspect
 from typing import Any
 
@@ -7,8 +8,9 @@ import pytest
 import torch
 
 from dynopsi.model.dyno_psi_model import DynoPsiModel
-from dynopsi.model.loaders import CheckpointSelectionError, HuggingFaceLoader
+from dynopsi.model.loaders import CheckpointIntegrityError, CheckpointSelectionError, HuggingFaceLoader
 from dynopsi.model.model_config import (
+    CHECKPOINT_SHORT_NAMES,
     DEFAULT_DYNOPSI_MODEL_CONFIG,
     DynoPsiModelConfig,
     HuggingFaceLoaderConfig,
@@ -115,7 +117,14 @@ def test_fixture_accepts_v1_hparam_names_and_strict_loads(tmp_path: Any, monkeyp
     monkeypatch.setattr("dynopsi.model.loaders.torch.load", _spy_load)
     monkeypatch.setattr("dynopsi.model.loaders.hf_hub_download", lambda **_kwargs: str(ckpt_path))
 
-    loaded = HuggingFaceLoader("dynotx/dynopsi", "fixture.ckpt", revision="fixture").load("cpu")
+    with open(ckpt_path, "rb") as checkpoint_file:
+        expected_sha256 = hashlib.file_digest(checkpoint_file, "sha256").hexdigest()
+    loaded = HuggingFaceLoader(
+        "dynotx/dynopsi",
+        "fixture.ckpt",
+        revision="fixture",
+        expected_sha256=expected_sha256,
+    ).load("cpu")
 
     assert inspect.signature(HuggingFaceLoader.load).parameters.keys() == {"self", "map_location"}
     assert load_calls
@@ -124,19 +133,59 @@ def test_fixture_accepts_v1_hparam_names_and_strict_loads(tmp_path: Any, monkeyp
     assert any(key.startswith("flow_matcher.denoiser.main_trunk.pair_update_layers") for key in loaded.state_dict())
 
 
+def test_hugging_face_loader_rejects_checksum_mismatch(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ckpt_path = tmp_path / "fixture.ckpt"
+    ckpt_path.write_bytes(b"not the published checkpoint")
+    monkeypatch.setattr("dynopsi.model.loaders.hf_hub_download", lambda **_kwargs: str(ckpt_path))
+
+    loader = HuggingFaceLoader(
+        "dynotx/dynopsi",
+        "fixture.ckpt",
+        revision="fixture",
+        expected_sha256="0" * 64,
+    )
+    with pytest.raises(CheckpointIntegrityError, match="SHA-256 mismatch"):
+        loader.read("cpu")
+
+
 def test_resolve_checkpoint_accepts_published_names_and_defaults_to_cicada() -> None:
     v1 = resolve_checkpoint("v1", origin="the test")
     assert v1.loader.filename == "dynopsi-1.ckpt"
     assert v1.loader.revision == "346e377be69ca2a8a78e6f921c08e2f3aa7b6e18"
+    assert CHECKPOINT_SHORT_NAMES["v1"].sha256 == "c99f19a445992b6f6d4792f2ba27a27625b20379554d5389c1f6d2b7f43d404f"
 
     cicada = resolve_checkpoint("v1.5-cicada", origin="the test")
     assert cicada.loader.filename == "dynopsi-1.5-cicada.ckpt"
     assert cicada.loader.revision == "f55d9e684659aaf627b5bfa4ab05f735a3398951"
+    assert (
+        CHECKPOINT_SHORT_NAMES["v1.5-cicada"].sha256
+        == "7a5bbc43efde45bbf04489ef280d2067751ba6f8a652c3aab8b510b91d1b3d39"
+    )
     assert default_checkpoint_label() == "v1.5-cicada"
     assert DEFAULT_DYNOPSI_MODEL_CONFIG.loader == cicada.loader
 
     with pytest.raises(CheckpointSelectionError, match="Unknown checkpoint"):
         resolve_checkpoint("missing", origin="the test")
+
+
+def test_model_config_rejects_unpublished_checkpoint_before_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _unexpected_download(**_kwargs: Any) -> str:
+        raise AssertionError("unsupported checkpoint reached the downloader")
+
+    monkeypatch.setattr("dynopsi.model.loaders.hf_hub_download", _unexpected_download)
+    config = DynoPsiModelConfig(
+        loader=HuggingFaceLoaderConfig(
+            repo_id="third-party/model",
+            filename="untrusted.ckpt",
+            revision="main",
+        )
+    )
+
+    with pytest.raises(CheckpointSelectionError, match="Unsupported checkpoint source"):
+        _ = config.dynopsi_model
 
 
 def test_prior_free_skips_download() -> None:
