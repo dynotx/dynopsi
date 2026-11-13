@@ -26,7 +26,7 @@ test-unit:
     uv run pytest tests/unit
 
 test-e2e:
-    uv run pytest tests/e2e
+    uv run bash tests/e2e/cli.sh --clean
 
 test-all: test-unit test-e2e
 

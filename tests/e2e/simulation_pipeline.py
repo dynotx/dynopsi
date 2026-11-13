@@ -68,7 +68,7 @@ OBSERVABLE_OUTPUT_CONFIGS: dict[str, ObservableOutputConfig] = {
 INFERENCE_MODEL_CONFIG: DynoPsiModelConfig = DEFAULT_DYNOPSI_MODEL_CONFIG
 
 DIFFUSION_COEFFICIENT_FUNCTIONS: dict[str, SingleParameterFunctionType] = {
-    "eps=0.0": InverseParameterFunction(eps=0.0),
+    "eps=0.0": InverseParameterFunction(eps=0.0, clamp_max=10.0),
     "eps=0.1": InverseParameterFunction(eps=0.1),
     "eps=1.0": InverseParameterFunction(eps=1.0),
 }
@@ -130,7 +130,7 @@ if __name__ == "__main__":
                 features_save_dir = os.path.join(base_output_dir, ode_simulation_name, featurization_name)
                 os.makedirs(features_save_dir, exist_ok=True)
                 ode_simulation.run(
-                    {"features": features},
+                    features,
                     features_save_dir,
                     num_samples=num_samples,
                     batch_size=batch_size,
@@ -172,7 +172,7 @@ if __name__ == "__main__":
                                 os.makedirs(features_save_dir, exist_ok=True)
                                 print(f"SDE SIMULATION: {sde_simulation_name}")
                                 sde_simulation.run(
-                                    {"features": features},
+                                    features,
                                     features_save_dir,
                                     num_samples=num_samples,
                                     batch_size=batch_size,
