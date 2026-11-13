@@ -1,3 +1,5 @@
+# Examples
+
 # Examples Table of Contents
 
 - `configurations` - run these using the `dynopsi check` and `dynopsi sample` CLI commands
@@ -21,7 +23,7 @@ Chain ids and residue positions can be specified in the target crop and hotspot 
 - `auth_residue_index`: Use the Author-defined indexing: residue indices and chain IDs are defined by the author of the deposited structure file.
 - `original_residue_index`: chains are labeled A, B, C, … and each chain's residues start at 1.
 
-We recommend loading your structure in [Mol*Viewer](https://molstar.org/viewer/) to select chains and indices. Mol*Viewer explicitly annotates with "AUTH" in scenarios where the author-defined chain ID and residue indexing diverges from standard PDB indexing.
+We recommend loading your structure in [Mol*Viewer](https://molstar.org/viewer/) to select chains and indices. Mol*Viewer explicitly annotates with "AUTH" in scenarios where the author-defined chain ID and residue indexing diverges from `original_residue_index`.
 
 For example, these are two equivalent featurizations for [TrkA](https://www.rcsb.org/structure/1WWW) (see also `example/configurations/multiple_residue_specifications.yaml` for a full configuration file example):
 

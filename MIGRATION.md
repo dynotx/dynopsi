@@ -132,7 +132,9 @@ ode_cooldown_score_scale_fn:
 ode_cooldown_min_t: 0.9
 ```
 
-Leave `diffusion_coefficient_fn` and `noise_scale_fn` as they are. An SDE configuration hits this failure. An ODE configuration does not. This `-1` block reproduces 1.0.0. The README Psi-1 starting schedule uses `ode_warmup_max_t: 0.10`.
+The README Psi-1 starting schedule uses `ode_warmup_max_t: 0.10`.
+
+Leave `diffusion_coefficient_fn` and `noise_scale_fn` as they are. An SDE configuration hits this failure. An ODE configuration does not.
 
 ### Change 3
 

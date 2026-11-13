@@ -55,6 +55,7 @@ def _reject_insertion_codes(structure: gemmi.Structure) -> None:
 
 def load_or_parse_ccd(ccd_path: Path | str = AA_CCD_CIF_FILE) -> dict[str, Mol]:
     """Load the CCD dictionary of residue name to rdkit.Chem.rdchem.Mol."""
+    # Nested so importing dynopsi does not import rdkit. Mol is TYPE_CHECKING-only.
     from pdbeccdutils.core import ccd_reader
 
     components = ccd_reader.read_pdb_components_file(str(ccd_path))

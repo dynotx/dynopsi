@@ -75,7 +75,7 @@ This is where you provide a target, optionally crop your target, and specify hot
     - `auth_residue_index`: Use the Author-defined indexing: residue indices and chain IDs are defined by the author of the deposited structure file.
     - `original_residue_index`: chains are labeled A, B, C, … and each chain's residues start at 1.
 
-    We recommend loading your structure in [Mol*Viewer](https://molstar.org/viewer/) to select chains and indices. Mol*Viewer explicitly annotates with "AUTH" in scenarios where the author-defined chain ID and residue indexing diverges from standard PDB indexing.
+    We recommend loading your structure in [Mol*Viewer](https://molstar.org/viewer/) to select chains and indices. Mol*Viewer explicitly annotates with "AUTH" in scenarios where the author-defined chain ID and residue indexing diverges from `original_residue_index`.
 
     It is strongly recommended that you [check](#check-design-pipeline) the output featurization before generating designs to make sure that you have defined the correct chain/index parameters, especially if you use `auth_residue_index`.
 
